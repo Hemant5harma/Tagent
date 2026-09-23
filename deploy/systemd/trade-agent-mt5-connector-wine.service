@@ -1,0 +1,26 @@
+[Unit]
+Description=Trade Agent MT5 connector in Wine
+Wants=network-online.target trade-agent-xvfb.service
+After=network-online.target trade-agent-xvfb.service
+
+[Service]
+Type=simple
+User=tradeagent
+Group=tradeagent
+WorkingDirectory=/opt/trade-agent
+EnvironmentFile=/etc/trade-agent/connector.env
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:99
+Environment=WINEPREFIX=/var/lib/trade-agent/wineprefix
+ExecStart=/opt/trade-agent/deploy/linux/run-mt5-connector-wine.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/trade-agent
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

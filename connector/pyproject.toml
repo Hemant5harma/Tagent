@@ -1,0 +1,15 @@
+[project]
+name = "trade-agent-mt5-connector"
+version = "0.1.0"
+requires-python = ">=3.13,<3.15"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "pydantic>=2.11,<3",
+  "uvicorn[standard]>=0.35,<1",
+  "MetaTrader5==5.0.6180",
+]
+
+[tool.uv]
+# The reviewed connector source stays in ../src. This environment installs only
+# Windows MT5 dependencies; deployment sets PYTHONPATH to the reviewed source.
+package = false

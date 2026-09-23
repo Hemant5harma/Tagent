@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: Unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v5
+      - name: Verify locked dependency manifests
+        run: |
+          uv lock --check
+          uv lock --project connector --check
+      - name: Install backend test environment
+        run: uv sync --locked --extra dev
+      - name: Test backend and connector contracts
+        run: uv run pytest
+      - name: Deployment static checks
+        run: |
+          uv run ruff check migrations deploy/provider_smoke.py
+          uv run ruff format --check migrations deploy/provider_smoke.py
+          uv run python -m compileall -q deploy/provider_smoke.py migrations

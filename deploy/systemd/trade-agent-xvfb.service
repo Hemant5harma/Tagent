@@ -1,0 +1,18 @@
+[Unit]
+Description=Virtual display for the MT5 Wine connector
+After=network.target
+
+[Service]
+Type=simple
+User=tradeagent
+Group=tradeagent
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/trade-agent
+
+[Install]
+WantedBy=multi-user.target
