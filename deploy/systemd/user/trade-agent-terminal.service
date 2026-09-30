@@ -1,0 +1,19 @@
+[Unit]
+Description=Trade Agent MT5 terminal
+Requires=trade-agent-display.service
+After=trade-agent-display.service
+PartOf=trade-agent-display.service
+
+[Service]
+WorkingDirectory=%h/trade-agent
+Environment=DISPLAY=:99
+Environment=WINEPREFIX=%h/trade-agent/wineprefix
+ExecStart=/usr/bin/wine %h/trade-agent/wineprefix/drive_c/MetaTrader5/terminal64.exe /portable "/config:C:\\trade-agent-terminal.ini"
+Restart=always
+RestartSec=5
+KillMode=process
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from decimal import Decimal
 from threading import Lock
+from urllib.parse import urlencode
 from uuid import uuid4
 
 import httpx
@@ -32,6 +33,9 @@ class BrokerUnavailable(RuntimeError):
 
 
 class BrokerAdapter(ABC):
+    def history(self, account_id: str, since: datetime, until: datetime) -> dict:
+        return {"since": since.isoformat(), "until": until.isoformat(), "deals": []}
+
     @abstractmethod
     def capabilities(self) -> dict[str, bool | int]: ...
 
@@ -343,6 +347,10 @@ class FakeBroker(BrokerAdapter):
 
 
 class MT5HTTPBroker(BrokerAdapter):
+    def history(self, account_id: str, since: datetime, until: datetime) -> dict:
+        query = urlencode({"since": since.isoformat(), "until": until.isoformat()})
+        return self._request("GET", f"/v1/accounts/{account_id}/history?{query}")
+
     """Authenticated HTTP client for the isolated MT5 connector process."""
 
     def __init__(self, base_url: str, token: str | None) -> None:

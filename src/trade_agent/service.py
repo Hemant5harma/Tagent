@@ -8,7 +8,7 @@ from threading import RLock
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from trade_agent.broker import BrokerAdapter, BrokerUnavailable
 from trade_agent.config import Settings
@@ -66,6 +66,12 @@ class TradeService:
             return record is not None and record.value == "true"
 
     def set_paused(self, paused: bool) -> None:
+        if (
+            not paused
+            and self.settings.broker_mode != "fake"
+            and not self.settings.assisted_demo_accepted
+        ):
+            raise ProposalError("Demo acceptance is pending. Entries remain paused.")
         now = to_db_time(utc_now())
         with self.database.session() as session:
             record = session.get(SystemStateRecord, "entries_paused")
@@ -116,11 +122,30 @@ class TradeService:
             )
 
     def validate(self, instruction: TradeInstruction) -> ValidatedTrade:
+        if self.settings.broker_mode != "fake":
+            if self.settings.trading_mode != "demo" or not self.settings.assisted_demo_accepted:
+                raise RiskRejected("Assisted demo acceptance is pending; entries are disabled")
+            if not self.settings.database_url.startswith("postgresql"):
+                raise RiskRejected("Connected trading requires PostgreSQL")
         if self._paused():
             raise RiskRejected("new entries are paused")
-        return self.risk.validate(instruction)
+        validated = self.risk.validate(instruction)
+        from trade_agent.limits import check_demo_budget
+
+        check_demo_budget(self, validated.account)
+        return validated
 
     def create_proposal(self, instruction: TradeInstruction) -> ProposalView:
+        from trade_agent.delivery import current_update_id
+
+        source_id = current_update_id.get()
+        if source_id:
+            with self.database.session() as session:
+                existing = session.scalar(
+                    select(ProposalRecord).where(ProposalRecord.source_update_id == source_id)
+                )
+                if existing:
+                    return self._view(existing)
         validated = self.validate(instruction)
         now = utc_now()
         proposal_id = str(uuid4())
@@ -144,6 +169,7 @@ class TradeService:
                     else None,
                     created_at=to_db_time(now),
                     updated_at=to_db_time(now),
+                    source_update_id=source_id,
                 )
             )
         self._event(proposal_id, None, "proposal_created", validated.summary())
@@ -250,6 +276,11 @@ class TradeService:
         intent_id = str(uuid4())
         key = str(uuid4())
         with self.database.session() as session:
+            if self.database.engine.dialect.name == "postgresql":
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:account))"),
+                    {"account": self.settings.account_id},
+                )
             record = session.get(ProposalRecord, proposal_id, with_for_update=True)
             if record is None:
                 raise ProposalError("proposal not found")
@@ -302,6 +333,20 @@ class TradeService:
             self._event(proposal_id, None, "confirmation_claimed", {"idempotency_key": key})
             try:
                 validated = self.validate(instruction)
+                approved = self.proposal(proposal_id).validation
+                spec = self.broker.symbol(instruction.symbol)
+                reference_key = "ask" if instruction.side.value == "buy" else "bid"
+                if (
+                    instruction.entry_price is None
+                    and abs(
+                        getattr(validated.quote, reference_key) - Decimal(approved[reference_key])
+                    )
+                    / spec.point
+                    > self.settings.max_slippage_points
+                ):
+                    raise RiskRejected(
+                        "quote moved beyond approved tolerance; create a fresh proposal"
+                    )
                 state = self.broker.state(instruction.account_id)
                 active_volume = sum(
                     (item.volume for item in state.orders), start=Decimal("0")
@@ -319,7 +364,10 @@ class TradeService:
                 result = self.broker.submit(instruction, validated.order_type, key)
             except BrokerUnavailable as exc:
                 self._finish_unknown(proposal_id, key, str(exc))
-                return {"status": "unknown", "message": str(exc)}
+                return {
+                    "status": "unknown",
+                    "message": "Outcome unknown—checking broker. Do not submit a replacement.",
+                }
             except (RiskRejected, ValueError) as exc:
                 self._finish_rejected(proposal_id, key, str(exc))
                 return {"status": "rejected", "message": str(exc)}
@@ -327,7 +375,10 @@ class TradeService:
             self._finish_unknown(
                 proposal_id, key, result.reason or "broker submission outcome is unknown"
             )
-            return {"status": "unknown", "message": result.reason}
+            return {
+                "status": "unknown",
+                "message": "Outcome unknown—checking broker. Do not submit a replacement.",
+            }
         if not result.accepted:
             self._finish_rejected(
                 proposal_id,
@@ -357,7 +408,14 @@ class TradeService:
                 f"submitted:{proposal_id}",
             )
         self._event(proposal_id, None, "submission_accepted", result.model_dump(mode="json"))
-        return {"status": "submitted", "result": result.model_dump(mode="json")}
+        execution_state = result.raw.get("execution_state", "accepted")
+        if execution_state in {"partial_fill", "filled", "pending_order"}:
+            self._event(proposal_id, None, f"broker_{execution_state}", {})
+        return {
+            "status": "submitted",
+            "result": result.model_dump(mode="json"),
+            "message": f"Broker outcome: {str(execution_state).replace('_', ' ')}. Monitoring broker state; no replacement order will be sent.",
+        }
 
     def _reserved_submission_volume(self, excluding: str | None = None) -> Decimal:
         with self.database.session() as session:
@@ -669,6 +727,101 @@ class TradeService:
         self._event(None, None, "protection_modified", {"action_proposal_id": proposal_id})
         return {"status": "completed"}
 
+    def create_exit_proposal(self, owner_id: str, target_id: str, kind: str) -> ActionProposalView:
+        if kind not in {"order", "position"}:
+            raise ProposalError("invalid exit target")
+        state = self.broker.state(self.settings.account_id)
+        targets = state.positions if kind == "position" else state.orders
+        target = next((t for t in targets if getattr(t, f"{kind}_id") == target_id), None)
+        if target is None:
+            raise ProposalError("target is no longer active")
+        stamp = utc_now()
+        record = ActionProposalRecord(
+            id=str(uuid4()),
+            owner_id=owner_id,
+            account_id=self.settings.account_id,
+            version=1,
+            action_type="close_position" if kind == "position" else "cancel_order",
+            target_kind=kind,
+            target_id=target_id,
+            payload={
+                "symbol": target.symbol,
+                "volume": str(target.volume),
+                "side": target.side.value,
+            },
+            status="pending_confirmation",
+            confirmation_token=str(uuid4()),
+            expires_at=to_db_time(
+                stamp + timedelta(seconds=self.settings.confirmation_ttl_seconds)
+            ),
+            created_at=to_db_time(stamp),
+            updated_at=to_db_time(stamp),
+        )
+        with self.database.session() as session:
+            session.add(record)
+        self._event(None, None, "exit_proposed", {"action_proposal_id": record.id})
+        return self._action_view(record)
+
+    def confirm_exit(self, proposal_id: str, owner_id: str, version: int, token: str) -> dict:
+        key = str(uuid4())
+        with self._mutation_lock, self.database.session() as session:
+            row = session.get(ActionProposalRecord, proposal_id, with_for_update=True)
+            if (
+                not row
+                or row.owner_id != owner_id
+                or row.version != version
+                or row.confirmation_token != token
+            ):
+                raise ProposalError("exit ownership or version mismatch")
+            if row.status != "pending_confirmation" or from_db_time(row.expires_at) <= utc_now():
+                raise ProposalError("exit proposal is expired or already handled")
+            if row.action_type not in {"close_position", "cancel_order"}:
+                raise ProposalError("not an exit proposal")
+            operation = "close" if row.target_kind == "position" else "cancel"
+            state = self.broker.state(self.settings.account_id)
+            targets = state.positions if operation == "close" else state.orders
+            target = next(
+                (t for t in targets if getattr(t, f"{row.target_kind}_id") == row.target_id), None
+            )
+            if (
+                target is None
+                or str(target.volume) != row.payload["volume"]
+                or target.symbol != row.payload["symbol"]
+                or target.side.value != row.payload["side"]
+            ):
+                raise ProposalError("target changed; request a fresh exit proposal")
+            row.status = "executing"
+            session.add(
+                MutationIntentRecord(
+                    id=str(uuid4()),
+                    action_proposal_id=row.id,
+                    operation=operation,
+                    target_id=row.target_id,
+                    idempotency_key=key,
+                    status="prepared",
+                    created_at=to_db_time(utc_now()),
+                    updated_at=to_db_time(utc_now()),
+                )
+            )
+            target_id, volume = row.target_id, Decimal(row.payload["volume"])
+        try:
+            if operation == "close":
+                self.broker.close(target_id, volume, idempotency_key=key)
+            else:
+                self.broker.cancel(target_id, idempotency_key=key)
+            status, message = "accepted", "Exit accepted by broker; checking final state."
+        except BrokerUnavailable:
+            status, message = "unknown", "Outcome unknown—checking broker. Do not repeat the exit."
+        except ValueError as exc:
+            status, message = "rejected", str(exc)
+        self._complete_mutation(key, ExecutionStatus(status))
+        with self.database.session() as session:
+            row = session.get(ActionProposalRecord, proposal_id)
+            assert row is not None
+            row.status = "completed" if status == "accepted" else status
+        self._event(None, None, f"exit_{status}", {"action_proposal_id": proposal_id})
+        return {"status": status, "message": message}
+
     def reject_action_proposal(
         self, proposal_id: str, owner_id: str, version: int, confirmation_token: str
     ) -> None:
@@ -852,11 +1005,47 @@ class TradeService:
         """Replay only when the connector proves it never journaled the operation."""
         try:
             with self._mutation_lock:
+                approved_volume = None
+                if row.action_proposal_id and row.operation in {"close", "cancel"}:
+                    with self.database.session() as session:
+                        action = session.get(ActionProposalRecord, row.action_proposal_id)
+                        if action is None:
+                            return False
+                        payload, kind = dict(action.payload), action.target_kind
+                        expired = from_db_time(action.expires_at) <= utc_now()
+                    state = self.broker.state(self.settings.account_id)
+                    targets = state.positions if kind == "position" else state.orders
+                    target = next(
+                        (t for t in targets if getattr(t, f"{kind}_id") == row.target_id), None
+                    )
+                    if (
+                        expired
+                        or target is None
+                        or target.symbol != payload["symbol"]
+                        or target.side.value != payload["side"]
+                        or target.volume != Decimal(payload["volume"])
+                    ):
+                        self._complete_mutation(
+                            row.idempotency_key,
+                            ExecutionStatus.REJECTED,
+                            {
+                                "reason": "Approved target changed or approval expired before recovery"
+                            },
+                        )
+                        with self.database.session() as session:
+                            action = session.get(ActionProposalRecord, row.action_proposal_id)
+                            if action is not None:
+                                action.status = ActionStatus.REJECTED.value
+                                action.updated_at = to_db_time(utc_now())
+                        return True
+                    approved_volume = Decimal(payload["volume"])
                 if row.operation == "cancel":
                     self.broker.cancel(row.target_id, row.idempotency_key)
                     status = ExecutionStatus.CANCELLED
                 elif row.operation == "close":
-                    self.broker.close(row.target_id, idempotency_key=row.idempotency_key)
+                    self.broker.close(
+                        row.target_id, approved_volume, idempotency_key=row.idempotency_key
+                    )
                     status = ExecutionStatus.CLOSED
                 elif row.operation == "modify" and row.action_proposal_id:
                     with self.database.session() as session:

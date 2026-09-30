@@ -20,3 +20,10 @@ data/
 logs/
 secrets/
 connector-journal.jsonl
+node_modules/
+.postgres.env
+.database-roles.json
+dashboard-release.tar.gz
+backups/
+frontend/test-results/
+frontend/playwright-report/

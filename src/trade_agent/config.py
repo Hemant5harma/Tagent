@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     auto_create_schema: bool = False
     host: str = "127.0.0.1"
     port: int = 8100
+    dashboard_port: int = 8102
+    dashboard_dist: str = "frontend/dist"
+    dashboard_url: str = ""
+    assisted_demo_accepted: bool = False
+    max_quote_age_seconds: float = 15.0
+    demo_daily_loss_limit: Decimal = Decimal("50")
+    demo_drawdown_limit: Decimal = Decimal("300")
     telegram_bot_token: str | None = None
     telegram_owner_id: str | None = None
     http_api_token: str | None = None
@@ -50,6 +57,10 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str | None = None
     openai_protocol: Literal["chat_completions", "responses"] = "chat_completions"
+    openai_response_format: Literal["json_schema", "json_object"] = "json_schema"
+    openai_timeout_seconds: float = 30.0
+    openai_reasoning_effort: Literal["low", "high", "max"] | None = None
+    openai_max_completion_tokens: int | None = None
     opencode_url: str = "http://127.0.0.1:4096"
     opencode_model_provider: str | None = None
     opencode_model: str | None = None

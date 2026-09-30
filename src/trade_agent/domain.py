@@ -46,6 +46,8 @@ class ExecutionStatus(StrEnum):
 
 class ActionType(StrEnum):
     MODIFY_PROTECTION = "modify_protection"
+    CLOSE_POSITION = "close_position"
+    CANCEL_ORDER = "cancel_order"
 
 
 class ActionStatus(StrEnum):

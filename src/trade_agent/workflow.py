@@ -9,6 +9,7 @@ proposal and confirmation boundary.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from importlib import import_module
@@ -72,6 +73,13 @@ class ConversationRunner:
             self._checkpointer_context = None
         self._graph = None
 
+    async def reset(self, owner_id: str) -> None:
+        graph = await self._ensure_graph()
+        await graph.aupdate_state(
+            {"configurable": {"thread_id": f"telegram:{owner_id}"}},
+            {"parsed": {}, "stage": "not_trade", "response": "Draft cleared."},
+        )
+
     async def _ensure_graph(self) -> CompiledStateGraph[Any, Any, Any, Any]:
         if self._graph is not None:
             return self._graph
@@ -82,9 +90,18 @@ class ConversationRunner:
 
         async def parse_message(state: ConversationState) -> dict[str, Any]:
             try:
-                previous = state.get("parsed")
+                previous = state.get("parsed") if state.get("stage") == "clarifying" else None
                 message = state["message"]
-                if isinstance(previous, dict):
+                # A side-only answer can complete a draft. A fresh instruction
+                # (including conversational "can you buy ...") must not inherit
+                # the previous trade's size or protection values.
+                if re.match(r"\s*new\b", message, re.I) or re.match(
+                    r"\s*(?:(?:please|can you|could you|i want to|i would like to)\s+)*(?:buy|sell)\s+\S",
+                    message,
+                    re.I,
+                ):
+                    previous = None
+                if previous:
                     message = (
                         "Continue this existing explicit trade draft. Preserve earlier values unless "
                         "the user explicitly replaces them.\n"
@@ -96,6 +113,7 @@ class ConversationRunner:
                     "stage": "failed",
                     "response": f"AI parser unavailable: {exc}",
                     "requires_trade_fields": [],
+                    "parsed": {},
                 }
             except ValueError as exc:
                 parsed = TradeProposalParse(
@@ -103,7 +121,7 @@ class ConversationRunner:
                     entry=ParsedEntry(kind="missing"),
                     clarification=str(exc),
                 )
-            if isinstance(previous, dict) and parsed.intent != "not_trade":
+            if previous and parsed.intent != "not_trade":
                 old = TradeProposalParse.model_validate(previous)
                 parsed = parsed.model_copy(
                     update={
@@ -116,11 +134,14 @@ class ConversationRunner:
                         "take_profit": parsed.take_profit or old.take_profit,
                         "deadline_at": parsed.deadline_at or old.deadline_at,
                         "note": parsed.note or old.note,
+                        "missing_fields": [],
                     }
                 )
-            return {"parsed": parsed.model_dump(mode="json")}
+            return {"parsed": parsed.model_dump(mode="json"), "stage": "clarifying"}
 
         def decide(state: ConversationState) -> dict[str, Any]:
+            if state.get("stage") == "failed":
+                return {"stage": "failed", "response": state["response"]}
             payload = state.get("parsed")
             if not isinstance(payload, dict):
                 return {
@@ -146,8 +167,9 @@ class ConversationRunner:
             missing = _missing_trade_fields(parsed)
             if parsed.intent != "trade" or missing:
                 text = (
-                    parsed.clarification
-                    or f"Please provide: {', '.join(missing or ['trade details'])}."
+                    f"Please provide: {', '.join(missing)}."
+                    if missing
+                    else (parsed.clarification or "Please clarify your trade details.")
                 )
                 return {"stage": "clarifying", "response": text, "requires_trade_fields": missing}
             return {

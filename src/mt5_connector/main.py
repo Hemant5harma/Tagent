@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 
 import uvicorn
@@ -32,6 +33,23 @@ class _ConnectorFormatter(logging.Formatter):
 
 def main() -> None:
     settings = ConnectorSettings.from_env()
+    settings.journal_path.parent.mkdir(parents=True, exist_ok=True)
+    process_lock = open(str(settings.journal_path) + ".lock", "a+b")
+    process_lock.write(b"0")
+    process_lock.flush()
+    process_lock.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(process_lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(process_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]  # Linux-only branch
+    except OSError as exc:
+        process_lock.close()
+        raise RuntimeError("Another connector owns this execution journal") from exc
     handler = logging.StreamHandler()
     handler.setFormatter(_ConnectorFormatter([settings.token, settings.password or ""]))
     root = logging.getLogger()

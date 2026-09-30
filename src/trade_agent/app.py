@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+import time
+from dataclasses import asdict
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import select
+
 from trade_agent.ai import ParsedEntry, TradeProposalParse, build_ai_backend
 from trade_agent.config import Settings
+from trade_agent.db import DashboardCacheRecord, IncomingUpdateRecord, ProposalRecord
+from trade_agent.delivery import current_update_id
 from trade_agent.domain import ProposalView, Side, TradeInstruction
+from trade_agent.reporting import activity, now, put_cache
 from trade_agent.service import ProposalError, TradeService
 from trade_agent.workflow import ConversationRunner
 
@@ -20,6 +29,68 @@ if TYPE_CHECKING:
 
 class InputIncomplete(ValueError):
     pass
+
+
+def _read_only_route(text: str) -> str | None:
+    """Recognize account questions without asking an LLM to parse a trade.
+
+    Action words take precedence: a question phrased as "can you buy" is still
+    an instruction candidate, never a read-only account query.
+    """
+    if re.match(
+        r"(?:explain|define)\b|what (?:is|does) (?:a |an |the )?(?:balance|equity|free margin)\b",
+        text,
+    ):
+        return None
+    if re.search(
+        r"\b(buy|sell|close|cancel|modify|change|replace|remove|set|execute|submit)\b", text
+    ):
+        return None
+    if (
+        re.search(r"\b(?:place|create|prepare)\b|\bopen\s+(?:a|an|one|new|another)\b", text)
+        or re.match(r"(?:(?:please|can you|could you|will you)\s+)?open\b", text)
+        and not re.fullmatch(r"open (?:trades?|positions?|orders?)", text)
+    ):
+        return None
+    if re.search(r"\b(balance|equity|free margin|account details|account information)\b", text):
+        return "account"
+    if re.search(
+        r"\b(positions?|open trades?|active trades?|running trades?)\b", text
+    ) or re.search(r"\btrades?\b.*\b(open|active|running)\b", text):
+        return "positions"
+    if re.search(r"\b(pending orders?|open orders?|orders? pending)\b", text):
+        return "orders"
+    if re.fullmatch(
+        r"(?:(?:please |can you |could you )?(?:show|check|tell)(?: me)?(?: my| our| the)? |(?:what is|what's) (?:my|our|the) )?(account|orders|status)",
+        text,
+    ):
+        return text.split()[-1]
+    if re.search(
+        r"\b(system|bot|agent) status\b|\b(?:are|is) (?:new )?entries (?:paused|enabled)\b", text
+    ):
+        return "status"
+    return None
+
+
+def _looks_like_trade_request(text: str) -> bool:
+    """Conservative routing only; extraction and authorization stay downstream."""
+    if re.match(r"(?:what|why|how|when|where|should|can i|could i)\b", text):
+        return False
+    return bool(
+        re.search(r"\b(buy|sell|close|cancel|modify|replace|execute|submit)\b", text)
+        or re.search(r"\b(?:open|place|create|prepare|new)\b.*\b(?:trade|order|position)\b", text)
+        or re.search(
+            r"\b(?:sl|tp|stop[ -]?loss|take[ -]?profit|entry|lots?|volume|size|deadline)\b.*\d",
+            text,
+        )
+        or re.search(r"\d+(?:\.\d+)?\s*lots?\b", text)
+        or re.fullmatch(
+            r"(?:entry\s+)?market|(?:eur|usd|gbp|jpy|chf|cad|aud|nzd|xau|xag){2}(?:[._][a-z]+)?",
+            text,
+        )
+        or re.match(r"\d+(?:\.\d+)?\b", text)
+        or re.match(r"(?:change|make|use|set|instead|actually)\b", text)
+    )
 
 
 def _decimal_match(pattern: str, text: str, label: str) -> Decimal:
@@ -89,10 +160,14 @@ def format_proposal(proposal: ProposalView) -> str:
     deadline = f"\nDeadline: {trade.deadline_at.isoformat()}" if trade.deadline_at else ""
     return (
         f"Confirm trade\n"
+        f"Account {trade.account_id} · {'DEMO' if proposal.validation.get('account_is_demo') else 'LIVE'}\n"
         f"{trade.side.value.upper()} {trade.symbol} · {trade.volume} lots\n"
         f"Order: {proposal.order_type.value} · entry {entry}\n"
         f"SL {trade.stop_loss} · TP {trade.take_profit}{deadline}\n"
         f"Current bid/ask: {proposal.validation['bid']} / {proposal.validation['ask']}\n"
+        f"Estimated loss at SL: {proposal.validation.get('estimated_loss', 'unavailable')} {proposal.validation.get('currency', '')}\n"
+        f"Estimated margin: {proposal.validation.get('estimated_margin', 'unavailable')}\n"
+        "Stops do not guarantee a maximum loss.\n"
         f"Proposal: {proposal.proposal_id} v{proposal.version}\n"
         f"This confirmation expires at {proposal.expires_at.isoformat()}"
     )
@@ -224,27 +299,245 @@ class TelegramApplicationFacade:
 
     async def record_telegram_update(self, *, update_id: str, owner_id: str) -> bool:
         self._authorize(owner_id)
+        current_update_id.set(update_id)
         return self.application.service.accept_telegram_update(update_id, owner_id)
 
     async def complete_telegram_update(self, *, update_id: str) -> None:
-        self.application.service.complete_telegram_update(update_id)
+        # Completion and the reply are committed together by queue_reply.
+        return None
+
+    async def queue_reply(self, update_id: str, reply: TelegramReply) -> None:
+        with self.application.service.database.session() as session:
+            row = session.get(IncomingUpdateRecord, update_id)
+            if row:
+                row.reply = asdict(reply)
+                row.status = "completed"
+                row.completed_at = now()
+
+    async def help(self, *, owner_id: str) -> TelegramReply:
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        return TelegramReply(
+            "Hi! I can help you prepare a Vantage MT5 demo trade, check your account, and explain the trading workflow. You choose the trade; I ask for missing details, then show one Confirm trade button.\n\nSend: buy/sell, symbol, lot size, entry market or price, SL and TP. I never invent missing values.\n\n/account /positions /orders /status /pause\n/new /cancel_draft /dashboard\n/close <position-id> prepares a confirmed full close. Autonomous trading is off."
+        )
+
+    async def reset_draft(self, *, owner_id: str) -> TelegramReply:
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        await self._conversation.reset(owner_id)
+        self._cancel_pending(owner_id)
+        return TelegramReply(
+            "Draft and pending trade confirmations cleared. No broker orders were cancelled. Send a new trade when ready."
+        )
+
+    async def exit_proposal(self, *, owner_id: str, target_id: str, kind: str) -> TelegramReply:
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        proposal = await asyncio.to_thread(
+            self.application.service.create_exit_proposal, owner_id, target_id, kind
+        )
+        details = proposal.payload
+        return TelegramReply(
+            f"Confirm {'full close' if kind == 'position' else 'cancellation'}\nAccount {self.application.settings.account_id} · {self.application.settings.trading_mode.upper()}\n{kind} #{target_id} · {details['symbol']} · {details['side']} · {details['volume']} lots\nExpires {proposal.expires_at.isoformat()}\nThis is not a new entry.",
+            confirmation_token=proposal.confirmation_token,
+            confirmation_kind="protection",
+        )
+
+    def _cancel_pending(self, owner_id: str) -> None:
+        with self.application.service.database.session() as session:
+            for row in session.scalars(
+                select(ProposalRecord).where(
+                    ProposalRecord.owner_id == owner_id,
+                    ProposalRecord.status == "pending_confirmation",
+                )
+            ):
+                if row.source_update_id != current_update_id.get():
+                    row.status = "cancelled"
+
+    async def dashboard(self, *, owner_id: str) -> TelegramReply:
+        from trade_agent.dashboard import issue_code
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        with self.application.service.database.session() as session:
+            cached = session.get(DashboardCacheRecord, "dashboard_url")
+            url = (
+                cached.payload.get("url", "") if cached else self.application.settings.dashboard_url
+            )
+        if not url:
+            return TelegramReply(
+                "The dashboard link is not available yet. Trading protection is independent of dashboard availability."
+            )
+        code = issue_code(self.application.service.database)
+        return TelegramReply(
+            f"Your private dashboard:\n{url}\n\nOne-use login code: {code}\nExpires in 5 minutes. Session lasts 12 hours. Keep the code private."
+        )
 
     async def create_trade_from_text(self, *, owner_id: str, text: str) -> TelegramReply:
         from trade_agent.telegram import TelegramReply
 
         self._authorize(owner_id)
+        normalized = re.sub(r"\s+", " ", text.strip().lower()).rstrip("?!. ")
+        if re.search(
+            r"\b\d{6,12}:[A-Za-z0-9_-]{20,}|(?i:password|api[_ -]?key|token|secret)\s*(?:[:=]|is\b)\s*\S+",
+            text,
+        ) or any(
+            secret and len(secret) > 8 and secret in text
+            for secret in (
+                self.application.settings.telegram_bot_token,
+                self.application.settings.openai_api_key,
+                self.application.settings.mt5_connector_token,
+            )
+        ):
+            return TelegramReply(
+                "Please don't send passwords or API keys here. Configure secrets through the protected server setup."
+            )
+        exit_match = re.fullmatch(
+            r"(?:please\s+)?(close|cancel)\s+(?:my\s+)?(?:(position|order)\s+)?#?(\d+)\s*",
+            normalized,
+        )
+        if exit_match:
+            return await self.exit_proposal(
+                owner_id=owner_id,
+                target_id=exit_match[3],
+                kind=exit_match[2] or ("position" if exit_match[1] == "close" else "order"),
+            )
+        routes = {
+            "account": self.account,
+            "show my account": self.account,
+            "balance": self.account,
+            "what is my balance": self.account,
+            "positions": self.positions,
+            "show my positions": self.positions,
+            "orders": self.orders,
+            "status": self.status,
+            "stop new trades": self.pause_entries,
+            "pause": self.pause_entries,
+            "hi": self.help,
+            "hello": self.help,
+            "hey": self.help,
+            "help": self.help,
+            "what can you do": self.help,
+            "how are you": self.help,
+        }
+        if normalized in routes:
+            return await routes[normalized](owner_id=owner_id)
+        read_only_route = _read_only_route(normalized)
+        if read_only_route:
+            return await getattr(self, read_only_route)(owner_id=owner_id)
+        if normalized in {
+            "yes",
+            "yes please",
+            "confirm",
+            "confirmed",
+            "go ahead",
+            "do it",
+            "okay",
+            "ok",
+        }:
+            return TelegramReply(
+                "Text replies do not authorize an order. Use the Confirm trade button on the exact proposal you reviewed, or send the missing trade details. No trade was submitted."
+            )
+        source = current_update_id.get()
+        if source:
+            with self.application.service.database.session() as session:
+                existing = session.scalar(
+                    select(ProposalRecord).where(ProposalRecord.source_update_id == source)
+                )
+                if existing:
+                    view = self.application.service._view(existing)
+                    return TelegramReply(
+                        format_proposal(view),
+                        confirmation_token=view.confirmation_token
+                        if existing.status == "pending_confirmation"
+                        else None,
+                        confirmation_kind="trade",
+                    )
+        started = time.monotonic()
         try:
-            outcome = await self._conversation.run(owner_id, text)
+            if _looks_like_trade_request(normalized):
+                outcome = await self._conversation.run(owner_id, text)
+            else:
+                # Ordinary conversation must not depend on structured trade
+                # extraction, and must not replace or cancel an active draft.
+                outcome = {
+                    "stage": "not_trade",
+                    "response": (
+                        "I can answer account questions and help prepare a trade for your review. "
+                        "Use /help for commands, or send buy/sell, symbol, size, entry, SL and TP. "
+                        "No trade was submitted."
+                    ),
+                    "requires_trade_fields": [],
+                    "parsed": None,
+                }
+            if outcome["stage"] in {"clarifying", "ready_for_confirmation", "failed"}:
+                self._cancel_pending(owner_id)
+            if outcome["stage"] == "not_trade":
+                backend = build_ai_backend(self.application.settings)
+                if hasattr(backend, "explain"):
+                    from trade_agent.ai import AIBackendError
+
+                    with self.application.service.database.session() as session:
+                        cached = session.get(DashboardCacheRecord, "broker")
+                        snapshot = cached.payload if cached else {}
+                        account = snapshot.get("account", {})
+                        evidence = {
+                            "observed_at": snapshot.get("observed_at"),
+                            "current_time": now().isoformat(),
+                            "account": {
+                                key: account.get(key)
+                                for key in (
+                                    "balance",
+                                    "equity",
+                                    "margin_free",
+                                    "currency",
+                                    "is_demo",
+                                )
+                            },
+                            "masked_account_id": "***" + str(account.get("account_id", ""))[-4:],
+                            "state": snapshot.get("state", {}),
+                            "entries_paused": snapshot.get("paused", True),
+                        }
+                    try:
+                        outcome["response"] = await backend.explain(text, json.dumps(evidence))
+                    except AIBackendError:
+                        outcome["stage"] = "failed"
+                        outcome["response"] = (
+                            "The assistant is temporarily unavailable. /account, /status and /pause still work. No trade was submitted."
+                        )
+            elapsed = int((time.monotonic() - started) * 1000)
+            activity(
+                self.application.service.database,
+                outcome["stage"],
+                f"User-directed: {text}\n{outcome['response']}",
+                elapsed,
+            )
+            put_cache(
+                self.application.service.database,
+                "model",
+                {
+                    "status": "error" if outcome["stage"] == "failed" else "ok",
+                    "latency_ms": elapsed,
+                    "model": self.application.settings.openai_model
+                    or self.application.settings.ai_provider,
+                },
+            )
             if outcome["stage"] != "ready_for_confirmation" or outcome["parsed"] is None:
                 return TelegramReply(outcome["response"])
             instruction = self._instruction_from_parse(owner_id, outcome["parsed"])
-            proposal = self.application.service.create_proposal(instruction)
+            proposal = await asyncio.to_thread(
+                self.application.service.create_proposal, instruction
+            )
             return TelegramReply(
                 format_proposal(proposal),
                 confirmation_token=proposal.confirmation_token,
                 confirmation_kind="trade",
             )
         except (InputIncomplete, ValueError) as exc:
+            activity(self.application.service.database, "rejected_proposal", str(exc))
             return TelegramReply(f"Trade was not created: {exc}")
 
     async def _parse_conversation_message(self, text: str) -> TradeProposalParse:
@@ -311,25 +604,25 @@ class TelegramApplicationFacade:
         from trade_agent.telegram import TelegramReply
 
         self._authorize(owner_id)
-        return TelegramReply(self.application.account_text())
+        return TelegramReply(await asyncio.to_thread(self.application.account_text))
 
     async def orders(self, *, owner_id: str) -> TelegramReply:
         from trade_agent.telegram import TelegramReply
 
         self._authorize(owner_id)
-        return TelegramReply(self.application.orders_text())
+        return TelegramReply(await asyncio.to_thread(self.application.orders_text))
 
     async def positions(self, *, owner_id: str) -> TelegramReply:
         from trade_agent.telegram import TelegramReply
 
         self._authorize(owner_id)
-        return TelegramReply(self.application.positions_text())
+        return TelegramReply(await asyncio.to_thread(self.application.positions_text))
 
     async def status(self, *, owner_id: str) -> TelegramReply:
         from trade_agent.telegram import TelegramReply
 
         self._authorize(owner_id)
-        return TelegramReply(self.application.status_text())
+        return TelegramReply(await asyncio.to_thread(self.application.status_text))
 
     async def pause_entries(self, *, owner_id: str) -> TelegramReply:
         from trade_agent.telegram import TelegramReply
@@ -383,8 +676,16 @@ class TelegramApplicationFacade:
         self._authorize(owner_id)
         try:
             proposal = self.application.service.proposal_by_token(confirmation_token)
-            result = self.application.service.confirm(
-                proposal.proposal_id, owner_id, proposal.version, confirmation_token
+            if proposal.status.value != "pending_confirmation":
+                return TelegramReply(
+                    f"This proposal is already {proposal.status.value}. No duplicate order was sent."
+                )
+            result = await asyncio.to_thread(
+                self.application.service.confirm,
+                proposal.proposal_id,
+                owner_id,
+                proposal.version,
+                confirmation_token,
             )
             return TelegramReply(result.get("message") or f"Trade {result['status']}.")
         except ProposalError as exc:
@@ -411,6 +712,15 @@ class TelegramApplicationFacade:
         self._authorize(owner_id)
         try:
             proposal = self.application.service.action_proposal_by_token(confirmation_token)
+            if proposal.action_type.value in {"close_position", "cancel_order"}:
+                result = await asyncio.to_thread(
+                    self.application.service.confirm_exit,
+                    proposal.proposal_id,
+                    owner_id,
+                    proposal.version,
+                    confirmation_token,
+                )
+                return TelegramReply(result["message"])
             result = self.application.service.confirm_protection_modification(
                 proposal.proposal_id, owner_id, proposal.version, confirmation_token
             )

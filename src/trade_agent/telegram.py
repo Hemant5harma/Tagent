@@ -62,6 +62,10 @@ class TelegramOperations(Protocol):
 
     async def status(self, *, owner_id: str) -> TelegramReply: ...
 
+    async def help(self, *, owner_id: str) -> TelegramReply: ...
+
+    async def exit_proposal(self, *, owner_id: str, target_id: str, kind: str) -> TelegramReply: ...
+
     async def pause_entries(self, *, owner_id: str) -> TelegramReply: ...
 
     async def resume_entries(self, *, owner_id: str) -> TelegramReply: ...
@@ -99,6 +103,8 @@ class TelegramGateway:
         self._operations = operations
 
     def install(self, application: Application) -> None:
+        for name in ("help", "start", "new", "cancel_draft", "dashboard"):
+            application.add_handler(CommandHandler(name, self.utility))
         application.add_handler(CommandHandler("account", self.account))
         application.add_handler(CommandHandler("orders", self.orders))
         application.add_handler(CommandHandler("positions", self.positions))
@@ -107,12 +113,57 @@ class TelegramGateway:
         application.add_handler(CommandHandler("resume", self.resume))
         application.add_handler(CommandHandler("provider", self.provider))
         application.add_handler(CommandHandler("protection", self.protection))
-        application.add_handler(
-            CallbackQueryHandler(
-                self.confirmation, pattern=r"^(confirm|reject):(trade|protection):"
-            )
-        )
+        application.add_handler(CommandHandler("close", self.exit_trade))
+        application.add_handler(CommandHandler("cancel_order", self.exit_trade))
+        # Consume even malformed/stale buttons so durable inbox rows cannot poison
+        # the processing queue. The full callback grammar is checked below.
+        application.add_handler(CallbackQueryHandler(self.confirmation))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.trade_text))
+        application.add_handler(MessageHandler(filters.COMMAND, self.utility))
+        application.add_handler(MessageHandler(filters.ALL, self.unsupported_message))
+
+    async def unsupported_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+
+        async def reply(owner_id: str) -> TelegramReply:
+            del owner_id
+            return TelegramReply(
+                "Please send your request as text. Photos, voice messages and other attachments "
+                "cannot place trades. Use /help for examples."
+            )
+
+        await self._dispatch(update, reply)
+
+    async def utility(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        del context
+        if update.effective_message is None:
+            return
+        command = (update.effective_message.text or "").split()[0].split("@")[0]
+        name = (
+            "reset_draft"
+            if command in {"/new", "/cancel_draft"}
+            else "dashboard"
+            if command == "/dashboard"
+            else "help"
+        )
+        await self._dispatch(
+            update, lambda owner_id: getattr(self._operations, name)(owner_id=owner_id)
+        )
+
+    async def exit_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_message is None or update.effective_message.text is None:
+            return
+        target_id = context.args[0] if context.args else ""
+        kind = "position" if update.effective_message.text.startswith("/close") else "order"
+        if not target_id.isdigit():
+            await self._dispatch(update, lambda owner_id: self._operations.help(owner_id=owner_id))
+            return
+        await self._dispatch(
+            update,
+            lambda owner_id: self._operations.exit_proposal(
+                owner_id=owner_id, target_id=target_id, kind=kind
+            ),
+        )
 
     async def account(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
@@ -206,7 +257,15 @@ class TelegramGateway:
             return
         matched = _CALLBACK_RE.fullmatch(query.data or "")
         if matched is None:
-            await query.answer("Invalid confirmation.", show_alert=True)
+            await self._complete(update)
+            await self._reply(
+                update,
+                TelegramReply("Invalid confirmation button. No action was taken. Use /help."),
+            )
+            try:
+                await query.answer("Invalid confirmation.", show_alert=True)
+            except Exception:
+                pass  # Expired callbacks must not prevent durable completion.
             return
         action, kind, token = matched.groups()
         try:
@@ -227,11 +286,19 @@ class TelegramGateway:
                     owner_id=owner_id, confirmation_token=token
                 )
             await self._complete(update)
-            await query.answer()
             await self._reply(update, reply)
+            try:
+                await query.answer()
+            except Exception:
+                pass  # A replayed callback may have expired; the durable reply still goes out.
         except Exception:  # Boundary must not leak failures or execution details to Telegram.
             LOGGER.exception("Telegram confirmation handling failed")
-            await query.answer("Could not process confirmation.", show_alert=True)
+            await self._reply(
+                update,
+                TelegramReply(
+                    "Confirmation outcome needs checking. Use /status; do not submit a replacement."
+                ),
+            )
 
     async def _dispatch(
         self,
@@ -252,7 +319,9 @@ class TelegramGateway:
             LOGGER.exception("Telegram command handling failed")
             await self._reply(
                 update,
-                TelegramReply("Could not process that request. No new order was submitted."),
+                TelegramReply(
+                    "Could not finish processing. Check /status before retrying any trade; an uncertain broker outcome must be reconciled."
+                ),
             )
 
     def _owner_for(self, update: Update) -> str | None:
@@ -279,6 +348,9 @@ class TelegramGateway:
         await self._operations.complete_telegram_update(update_id=str(update.update_id))
 
     async def _reply(self, update: Update, reply: TelegramReply) -> None:
+        if self._owner_for(update) is not None and hasattr(self._operations, "queue_reply"):
+            await self._operations.queue_reply(str(update.update_id), reply)
+            return
         message = update.effective_message
         if message is None:
             return
@@ -299,8 +371,11 @@ def _confirmation_markup(
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Confirm", callback_data=f"confirm:{kind}:{token}"),
-                InlineKeyboardButton("Reject", callback_data=f"reject:{kind}:{token}"),
+                InlineKeyboardButton(
+                    "Confirm trade" if kind == "trade" else "Confirm action",
+                    callback_data=f"confirm:{kind}:{token}",
+                ),
+                InlineKeyboardButton("Cancel", callback_data=f"reject:{kind}:{token}"),
             ]
         ]
     )

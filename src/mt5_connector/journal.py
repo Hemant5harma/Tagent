@@ -113,3 +113,17 @@ class JSONLRequestJournal:
         with self._lock:
             record = self._records.get(key)
             return dict(record) if record is not None else None
+
+    def lookup_operation(self, key: str) -> dict[str, Any] | None:
+        """Resolve old mutation namespaces without changing persisted journal keys."""
+        with self._lock:
+            records = [
+                record
+                for stored, record in self._records.items()
+                if stored == key
+                or stored
+                in {f"mutation:{operation}:{key}" for operation in ("close", "cancel", "modify")}
+            ]
+            if len(records) > 1:
+                raise IdempotencyConflict("operation key is ambiguous")
+            return dict(records[0]) if records else None

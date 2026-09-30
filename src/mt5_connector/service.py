@@ -141,6 +141,27 @@ class MT5Service:
         self._gateway = gateway or MT5Gateway(settings)
         self._mutation_lock = RLock()
 
+    def _check_clock(self, value: datetime) -> None:
+        for bound, lower in (
+            (self._settings.server_time_valid_from, True),
+            (self._settings.server_time_valid_until, False),
+        ):
+            if bound:
+                boundary = datetime.fromisoformat(bound)
+                if (lower and value < boundary) or (not lower and value >= boundary):
+                    raise ConnectorError("broker clock profile requires review for this date")
+
+    def _server_timestamp(self, value: Any) -> datetime:
+        normalized = _utc_timestamp(value) - timedelta(
+            seconds=self._settings.server_time_offset_seconds
+        )
+        self._check_clock(normalized)
+        return normalized
+
+    def _server_bound(self, value: datetime) -> datetime:
+        self._check_clock(value)
+        return value + timedelta(seconds=self._settings.server_time_offset_seconds)
+
     def health(self) -> dict[str, Any]:
         connected = self._gateway.is_connected()
         return {
@@ -224,7 +245,7 @@ class MT5Service:
             "symbol": symbol.upper(),
             "bid": _decimal(tick.bid),
             "ask": _decimal(tick.ask),
-            "observed_at": _utc_timestamp(
+            "observed_at": self._server_timestamp(
                 getattr(tick, "time", int(datetime.now(UTC).timestamp()))
             ),
         }
@@ -329,7 +350,7 @@ class MT5Service:
             specified_flag = int(getattr(mt5, "SYMBOL_EXPIRATION_SPECIFIED", 4))
             if instruction.deadline_at is not None and expiration_mode & specified_flag:
                 request["type_time"] = int(mt5.ORDER_TIME_SPECIFIED)
-                request["expiration"] = int(instruction.deadline_at.timestamp())
+                request["expiration"] = int(self._server_bound(instruction.deadline_at).timestamp())
             else:
                 request["type_time"] = int(mt5.ORDER_TIME_GTC)
             request["type_filling"] = int(mt5.ORDER_FILLING_RETURN)
@@ -436,6 +457,17 @@ class MT5Service:
                 "retcode": retcode,
                 "comment": str(raw.get("comment", "")),
                 "request_id": raw.get("request_id"),
+                "execution_state": (
+                    "partial_fill"
+                    if retcode == int(getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010))
+                    else "filled"
+                    if accepted and deal_id
+                    else "pending_order"
+                    if accepted and order_type != "market"
+                    else "accepted"
+                    if accepted
+                    else "rejected"
+                ),
             },
         )
 
@@ -558,6 +590,55 @@ class MT5Service:
             "positions": [self._position_snapshot(mt5, position) for position in positions],
         }
 
+    def history(self, account_id: str, since: datetime, until: datetime) -> dict[str, Any]:
+        self.account(account_id)
+        if (
+            since.tzinfo is None
+            or until.tzinfo is None
+            or until <= since
+            or (until - since).days > 366
+        ):
+            raise ConnectorError("history requires an aware, ordered range of at most 366 days")
+        with self._mutation_lock:
+            mt5 = self._gateway.connect()
+            deals = mt5.history_deals_get(self._server_bound(since), self._server_bound(until))
+        if deals is None:
+            raise TerminalUnavailable("broker deal history is unavailable")
+        fields = (
+            "ticket",
+            "order",
+            "position_id",
+            "time",
+            "time_msc",
+            "type",
+            "entry",
+            "magic",
+            "symbol",
+            "volume",
+            "price",
+            "profit",
+            "commission",
+            "swap",
+            "fee",
+        )
+        normalized_deals = []
+        for item in deals:
+            deal = {field: str(getattr(item, field, "")) for field in fields}
+            deal["server_time_raw"] = deal["time"]
+            deal["server_time_msc_raw"] = deal["time_msc"]
+            deal["time"] = str(int(self._server_timestamp(deal["time"]).timestamp()))
+            if deal["time_msc"]:
+                deal["time_msc"] = str(
+                    int(deal["time_msc"]) - self._settings.server_time_offset_seconds * 1000
+                )
+            normalized_deals.append(deal)
+        return {
+            "since": since.isoformat(),
+            "until": until.isoformat(),
+            "clock_offset_seconds": self._settings.server_time_offset_seconds,
+            "deals": normalized_deals,
+        }
+
     def reconcile_submission(
         self, idempotency_key: str, journal_record: dict[str, Any] | None
     ) -> dict[str, Any]:
@@ -575,8 +656,12 @@ class MT5Service:
             try:
                 active_orders = mt5.orders_get() or ()
                 active_positions = mt5.positions_get() or ()
-                history_orders = mt5.history_orders_get(since, now) or ()
-                history_deals = mt5.history_deals_get(since, now) or ()
+                history_orders = (
+                    mt5.history_orders_get(self._server_bound(since), self._server_bound(now)) or ()
+                )
+                history_deals = (
+                    mt5.history_deals_get(self._server_bound(since), self._server_bound(now)) or ()
+                )
             except Exception as exc:  # noqa: BLE001 - MT5 history is an external boundary
                 raise TerminalUnavailable("MT5 history is unavailable for reconciliation") from exc
 
@@ -631,8 +716,7 @@ class MT5Service:
         except ValueError:
             return None
 
-    @staticmethod
-    def _order_snapshot(mt5: Any, order: Any) -> dict[str, Any]:
+    def _order_snapshot(self, mt5: Any, order: Any) -> dict[str, Any]:
         type_map = {
             int(mt5.ORDER_TYPE_BUY_LIMIT): ("buy", "buy_limit"),
             int(mt5.ORDER_TYPE_BUY_STOP): ("buy", "buy_stop"),
@@ -650,11 +734,10 @@ class MT5Service:
             "stop_loss": _decimal(order.sl) if _decimal(order.sl) > 0 else None,
             "take_profit": _decimal(order.tp) if _decimal(order.tp) > 0 else None,
             "status": "pending",
-            "created_at": _utc_timestamp(order.time_setup),
+            "created_at": self._server_timestamp(order.time_setup),
         }
 
-    @staticmethod
-    def _position_snapshot(mt5: Any, position: Any) -> dict[str, Any]:
+    def _position_snapshot(self, mt5: Any, position: Any) -> dict[str, Any]:
         is_buy = int(position.type) == int(mt5.POSITION_TYPE_BUY)
         stop_loss = _decimal(position.sl)
         take_profit = _decimal(position.tp)
@@ -667,5 +750,5 @@ class MT5Service:
             "stop_loss": stop_loss if stop_loss > 0 else None,
             "take_profit": take_profit if take_profit > 0 else None,
             "profit": _decimal(position.profit),
-            "opened_at": _utc_timestamp(position.time),
+            "opened_at": self._server_timestamp(position.time),
         }

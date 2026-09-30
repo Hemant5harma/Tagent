@@ -63,6 +63,43 @@ def test_openai_chat_adapter_requests_json_schema_and_returns_parse() -> None:
     asyncio.run(run())
 
 
+def test_openai_chat_json_object_mode_validates_result_locally() -> None:
+    async def run() -> None:
+        seen: dict[str, object] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": json.dumps(_trade_parse())}}]},
+            )
+
+        async with httpx.AsyncClient(
+            base_url="https://provider.example/v1", transport=httpx.MockTransport(handler)
+        ) as client:
+            backend = OpenAICompatibleBackend(
+                base_url="https://provider.example/v1",
+                api_key="test-key",
+                model="test-model",
+                protocol="chat_completions",
+                response_format="json_object",
+                reasoning_effort="low",
+                max_completion_tokens=3000,
+                client=client,
+            )
+            result = await backend.parse_trade("Buy EURUSD 0.10 at market SL 1.075 TP 1.09")
+
+        assert result.symbol == "EURUSD"
+        body = seen["body"]
+        assert isinstance(body, dict)
+        assert body["response_format"] == {"type": "json_object"}
+        assert body["reasoning_effort"] == "low"
+        assert body["max_completion_tokens"] == 3000
+        assert "Copy all explicitly stated values" in body["messages"][0]["content"]
+
+    asyncio.run(run())
+
+
 def test_opencode_adapter_uses_validated_structured_output() -> None:
     async def run() -> None:
         requests: list[tuple[str, dict[str, object]]] = []

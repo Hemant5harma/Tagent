@@ -30,6 +30,7 @@ class ProposalRecord(Base):
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source_update_id: Mapped[str | None] = mapped_column(String(128), unique=True)
 
 
 class ExecutionIntentRecord(Base):
@@ -77,6 +78,50 @@ class IncomingUpdateRecord(Base):
     status: Mapped[str] = mapped_column(String(32), default="received", index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    payload: Mapped[dict | None] = mapped_column(JSON)
+    reply: Mapped[dict | None] = mapped_column(JSON)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DashboardCacheRecord(Base):
+    __tablename__ = "dashboard_cache"
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class BrokerDealRecord(Base):
+    __tablename__ = "broker_deals"
+    id: Mapped[str] = mapped_column(String(160), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    position_id: Mapped[str] = mapped_column(String(128), index=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+
+
+class EquityRecord(Base):
+    __tablename__ = "equity_snapshots"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+
+
+class AgentActivityRecord(Base):
+    __tablename__ = "agent_activity"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(64), index=True)
+    summary: Mapped[str] = mapped_column(Text)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class DashboardAccessRecord(Base):
+    __tablename__ = "dashboard_access"
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class ActionProposalRecord(Base):

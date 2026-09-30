@@ -7,6 +7,7 @@ import json
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
@@ -250,7 +251,19 @@ def create_app(
     @app.get("/v1/reconciliation/{idempotency_key}", dependencies=[Depends(authorize)])
     def reconciliation(idempotency_key: str) -> dict[str, Any]:
         try:
-            return service.reconcile_submission(idempotency_key, journal.lookup(idempotency_key))
+            record = journal.lookup_operation(idempotency_key)
+            if record and str(record["key"]).startswith("mutation:"):
+                result = record.get("result") or {}
+                return {
+                    "idempotency_key": idempotency_key,
+                    "status": result.get("status", "unknown"),
+                    "journal_status": record["status"],
+                    "journal_result": result,
+                    "order_ids": [],
+                    "deal_ids": [],
+                    "position_ids": [],
+                }
+            return service.reconcile_submission(idempotency_key, record)
         except ConnectorError as exc:
             raise connector_error(exc) from exc
 
@@ -258,6 +271,13 @@ def create_app(
     def state(account_id: str) -> dict[str, Any]:
         try:
             return service.state(account_id)
+        except ConnectorError as exc:
+            raise connector_error(exc) from exc
+
+    @app.get("/v1/accounts/{account_id}/history", dependencies=[Depends(authorize)])
+    def history(account_id: str, since: datetime, until: datetime) -> dict[str, Any]:
+        try:
+            return service.history(account_id, since, until)
         except ConnectorError as exc:
             raise connector_error(exc) from exc
 

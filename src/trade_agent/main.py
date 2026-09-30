@@ -39,7 +39,8 @@ def main() -> None:
     settings = Settings()
     configure_logging(settings)
     facade, worker = build_runtime(settings)
-    api = create_api(facade, worker)
+    # Protection runs separately so model calls cannot hold up broker monitoring.
+    api = create_api(facade)
     if not settings.telegram_bot_token:
         uvicorn.run(api, host=settings.host, port=settings.port)
         return
@@ -63,11 +64,20 @@ async def _serve_with_telegram(
     await telegram.start()
     if telegram.updater is None:
         raise RuntimeError("Telegram application does not provide an updater")
-    await telegram.updater.start_polling(drop_pending_updates=False)
+    from trade_agent.polling import deliver, process, receive
+
+    db = facade.service.database
+    tasks = [
+        asyncio.create_task(receive(telegram, db, str(settings.telegram_owner_id))),
+        asyncio.create_task(process(telegram, db)),
+        asyncio.create_task(deliver(telegram, db)),
+    ]
     try:
         await server.serve()
     finally:
-        await telegram.updater.stop()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await telegram.stop()
         await telegram.shutdown()
         await telegram_facade.aclose()

@@ -6,7 +6,7 @@ dependencies = [
   "fastapi>=0.116,<1",
   "pydantic>=2.11,<3",
   "uvicorn[standard]>=0.35,<1",
-  "MetaTrader5==5.0.6180",
+  "MetaTrader5==5.0.6231",
 ]
 
 [tool.uv]

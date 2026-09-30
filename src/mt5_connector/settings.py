@@ -39,6 +39,10 @@ class ConnectorSettings:
     portable: bool = False
     magic: int = 2_026_092_201
     deviation_points: int = 20
+    # Explicit, verified broker clock profile; never infer from a potentially stale tick.
+    server_time_offset_seconds: int = 0
+    server_time_valid_from: str | None = None
+    server_time_valid_until: str | None = None
 
     @classmethod
     def from_env(cls) -> ConnectorSettings:
@@ -69,4 +73,11 @@ class ConnectorSettings:
                 "MT5_CONNECTOR_DEVIATION_POINTS",
                 20,
             ),
+            server_time_offset_seconds=_int(
+                os.environ.get("MT5_CONNECTOR_SERVER_TIME_OFFSET_SECONDS"),
+                "MT5_CONNECTOR_SERVER_TIME_OFFSET_SECONDS",
+                0,
+            ),
+            server_time_valid_from=os.environ.get("MT5_CONNECTOR_SERVER_TIME_VALID_FROM"),
+            server_time_valid_until=os.environ.get("MT5_CONNECTOR_SERVER_TIME_VALID_UNTIL"),
         )
