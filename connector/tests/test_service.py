@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,6 +152,41 @@ def test_connected_terminal_must_match_configured_login_and_server(tmp_path: Pat
     )
     with pytest.raises(TerminalUnavailable, match="MT5_CONNECTOR_SERVER"):
         MT5Gateway(wrong_server, module=mt5).connect()
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_pending_expiry_rejects_unsupported_without_gtc_fallback(tmp_path, supported):
+    settings = ConnectorSettings(token="t" * 24, journal_path=tmp_path / "journal.jsonl")
+    mt5 = FakeMT5()
+    mt5.ORDER_TIME_SPECIFIED = 2
+    original = mt5.symbol_info
+
+    def info(symbol):
+        value = original(symbol)
+        value.expiration_mode = 4 if supported else 0
+        return value
+
+    mt5.symbol_info = info
+    service = MT5Service(settings, MT5Gateway(settings, module=mt5))
+    expiry = datetime.now(UTC) + timedelta(hours=2)
+    instruction = TradeInstructionPayload(
+        owner_id="owner",
+        account_id="12345",
+        symbol="EURUSD",
+        side="buy",
+        volume=Decimal(".1"),
+        entry_price=Decimal("1.07"),
+        stop_loss=Decimal("1.06"),
+        take_profit=Decimal("1.08"),
+        pending_expires_at=expiry,
+        requested_order_type="buy_limit",
+    )
+    _, request, _, error = service._request_for(instruction, "buy_limit", "a" * 16)
+    if supported:
+        assert error is None and request["type_time"] == 2 and request["expiration"]
+    else:
+        assert "GTC was not substituted" in error
+    assert mt5.submissions == []
 
 
 def test_reconciliation_finds_historical_deal_by_idempotency_comment(tmp_path: Path) -> None:

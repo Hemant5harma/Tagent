@@ -64,6 +64,14 @@ class TelegramOperations(Protocol):
 
     async def help(self, *, owner_id: str) -> TelegramReply: ...
 
+    async def autonomy(self, *, owner_id: str) -> TelegramReply: ...
+
+    async def performance(self, *, owner_id: str, scope: str) -> TelegramReply: ...
+
+    async def decisions(self, *, owner_id: str) -> TelegramReply: ...
+
+    async def diagnostics(self, *, owner_id: str) -> TelegramReply: ...
+
     async def exit_proposal(self, *, owner_id: str, target_id: str, kind: str) -> TelegramReply: ...
 
     async def pause_entries(self, *, owner_id: str) -> TelegramReply: ...
@@ -103,12 +111,16 @@ class TelegramGateway:
         self._operations = operations
 
     def install(self, application: Application) -> None:
-        for name in ("help", "start", "new", "cancel_draft", "dashboard"):
+        for name in ("help", "start", "new", "cancel_draft", "dashboard", "memory", "forget"):
             application.add_handler(CommandHandler(name, self.utility))
         application.add_handler(CommandHandler("account", self.account))
         application.add_handler(CommandHandler("orders", self.orders))
         application.add_handler(CommandHandler("positions", self.positions))
         application.add_handler(CommandHandler("status", self.status))
+        application.add_handler(CommandHandler("autonomy", self.monitoring))
+        application.add_handler(CommandHandler("performance", self.monitoring))
+        application.add_handler(CommandHandler("decisions", self.monitoring))
+        application.add_handler(CommandHandler("diagnostics", self.monitoring))
         application.add_handler(CommandHandler("pause", self.pause))
         application.add_handler(CommandHandler("resume", self.resume))
         application.add_handler(CommandHandler("provider", self.provider))
@@ -140,7 +152,9 @@ class TelegramGateway:
             return
         command = (update.effective_message.text or "").split()[0].split("@")[0]
         name = (
-            "reset_draft"
+            command[1:]
+            if command in {"/memory", "/forget"}
+            else "reset_draft"
             if command in {"/new", "/cancel_draft"}
             else "dashboard"
             if command == "/dashboard"
@@ -180,6 +194,29 @@ class TelegramGateway:
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context
         await self._dispatch(update, lambda owner_id: self._operations.status(owner_id=owner_id))
+
+    async def monitoring(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_message is None:
+            return
+        command = (update.effective_message.text or "").split()[0].split("@")[0]
+        if command == "/performance":
+            scope = context.args[0].lower() if context.args else "all"
+            await self._dispatch(
+                update,
+                lambda owner_id: self._operations.performance(owner_id=owner_id, scope=scope),
+            )
+        elif command == "/autonomy":
+            await self._dispatch(
+                update, lambda owner_id: self._operations.autonomy(owner_id=owner_id)
+            )
+        elif command == "/diagnostics":
+            await self._dispatch(
+                update, lambda owner_id: self._operations.diagnostics(owner_id=owner_id)
+            )
+        else:
+            await self._dispatch(
+                update, lambda owner_id: self._operations.decisions(owner_id=owner_id)
+            )
 
     async def pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         del context

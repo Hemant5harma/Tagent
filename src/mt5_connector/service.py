@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from threading import RLock
@@ -12,6 +14,7 @@ from mt5_connector.contracts import (
     ModifyRequest,
     OrderType,
     PreflightResponse,
+    ProfitTargetRequest,
     SubmissionResponse,
     TradeInstructionPayload,
 )
@@ -151,6 +154,183 @@ class MT5Service:
                 if (lower and value < boundary) or (not lower and value >= boundary):
                     raise ConnectorError("broker clock profile requires review for this date")
 
+    def bars(self, symbol: str, timeframe: str = "M15", count: int = 200) -> list[dict[str, Any]]:
+        """Bounded read-only history; never include the terminal's forming candle."""
+        durations = {"M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}
+        if timeframe not in durations or not 50 <= count <= 1000:
+            raise ConnectorError("candles require M5/M15/M30/H1/H4/D1 and count 50..1000")
+        mt5, _ = self._symbol_info(symbol)
+        constant = getattr(mt5, f"TIMEFRAME_{timeframe}", None)
+        if constant is None:
+            raise TerminalUnavailable("terminal timeframe is unavailable")
+        rates = mt5.copy_rates_from_pos(symbol, constant, 1, count)
+        if rates is None:
+            raise TerminalUnavailable("MT5 candle history is unavailable")
+        now = datetime.now(UTC)
+        result = []
+        for row in rates:
+            opened = self._server_timestamp(row["time"])
+            closed = opened + timedelta(seconds=durations[timeframe])
+            if closed > now:
+                continue
+            prices = {key: _decimal(row[key]) for key in ("open", "high", "low", "close")}
+            if any(not value.is_finite() or value <= 0 for value in prices.values()):
+                raise ConnectorError("terminal returned invalid candle prices")
+            result.append(
+                {
+                    "time": opened.isoformat(),
+                    "closed_at": closed.isoformat(),
+                    **{key: str(value) for key, value in prices.items()},
+                    "tick_volume": int(row["tick_volume"]),
+                    "spread": int(row["spread"]),
+                }
+            )
+        return result
+
+    def historical_bars(
+        self, symbol: str, timeframe: str, since: datetime, until: datetime
+    ) -> dict[str, Any]:
+        """Export closed broker bars for research; reject incomplete/oversized responses."""
+        durations = {"M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}
+        if timeframe not in durations:
+            raise ConnectorError("unsupported research timeframe")
+        self._research_range(since, until, max_days=31)
+        mt5, _ = self._symbol_info(symbol)
+        constant = getattr(mt5, f"TIMEFRAME_{timeframe}", None)
+        if constant is None:
+            raise TerminalUnavailable("terminal timeframe is unavailable")
+        rows = mt5.copy_rates_range(
+            symbol, constant, self._server_bound(since), self._server_bound(until)
+        )
+        if rows is None:
+            raise TerminalUnavailable("MT5 historical bars are unavailable")
+        if len(rows) > 10000:
+            raise ConnectorError("historical bar response exceeds 10000 rows; use a shorter range")
+        bars = []
+        previous = None
+        gaps = []
+        for row in rows:
+            opened = self._server_timestamp(row["time"])
+            closed = opened + timedelta(seconds=durations[timeframe])
+            if opened < since or closed > min(until, datetime.now(UTC)):
+                continue
+            if previous is not None and opened <= previous:
+                raise ConnectorError("historical bars are not strictly ordered")
+            if previous is not None and (opened - previous).total_seconds() > durations[timeframe]:
+                gaps.append({"after": previous.isoformat(), "before": opened.isoformat()})
+            prices = {key: _decimal(row[key]) for key in ("open", "high", "low", "close")}
+            if (
+                any(not value.is_finite() or value <= 0 for value in prices.values())
+                or prices["low"] > min(prices["open"], prices["close"])
+                or prices["high"] < max(prices["open"], prices["close"])
+            ):
+                raise ConnectorError("terminal returned invalid historical candle prices")
+            bars.append(
+                {
+                    "time": opened.isoformat(),
+                    "closed_at": closed.isoformat(),
+                    **{key: str(value) for key, value in prices.items()},
+                    "tick_volume": int(row["tick_volume"]),
+                    "spread_points": int(row["spread"]),
+                }
+            )
+            previous = opened
+        return self._research_result(symbol, since, until, bars, "bars", timeframe, gaps)
+
+    def historical_ticks(self, symbol: str, since: datetime, until: datetime) -> dict[str, Any]:
+        """Export actual bid/ask quotes, not synthetic OHLC spreads."""
+        self._research_range(since, until, max_days=1)
+        if until - since > timedelta(hours=1):
+            raise ConnectorError("historical ticks require a range of at most one hour")
+        mt5, _ = self._symbol_info(symbol)
+        rows = mt5.copy_ticks_range(
+            symbol, self._server_bound(since), self._server_bound(until), mt5.COPY_TICKS_INFO
+        )
+        if rows is None:
+            raise TerminalUnavailable("MT5 historical ticks are unavailable")
+        if len(rows) > 10000:
+            raise ConnectorError("historical tick response exceeds 10000 rows; use a shorter range")
+        ticks = []
+        previous = None
+        for row in rows:
+            milliseconds = int(row["time_msc"]) - self._settings.server_time_offset_seconds * 1000
+            instant = datetime.fromtimestamp(milliseconds / 1000, UTC)
+            self._check_clock(instant)
+            if instant < since or instant >= until:
+                continue
+            if previous is not None and milliseconds < previous:
+                raise ConnectorError("historical ticks are not ordered")
+            bid, ask = _decimal(row["bid"]), _decimal(row["ask"])
+            if not bid.is_finite() or not ask.is_finite() or bid <= 0 or ask < bid:
+                raise ConnectorError("terminal returned invalid historical bid/ask")
+            ticks.append(
+                {
+                    "time": instant.isoformat(),
+                    "time_msc": milliseconds,
+                    "bid": str(bid),
+                    "ask": str(ask),
+                    "spread": str(ask - bid),
+                }
+            )
+            previous = milliseconds
+        return self._research_result(symbol, since, until, ticks, "ticks", None, [])
+
+    @staticmethod
+    def _research_range(since: datetime, until: datetime, *, max_days: int) -> None:
+        if (
+            since.tzinfo is None
+            or until.tzinfo is None
+            or until <= since
+            or until - since > timedelta(days=max_days)
+            or until > datetime.now(UTC)
+        ):
+            raise ConnectorError(
+                f"research requires a past, aware UTC range of at most {max_days} days"
+            )
+
+    def _research_result(
+        self,
+        symbol: str,
+        since: datetime,
+        until: datetime,
+        rows: list[dict[str, Any]],
+        kind: str,
+        timeframe: str | None,
+        gaps: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        canonical = json.dumps(
+            {"symbol": symbol, "kind": kind, "timeframe": timeframe, "rows": rows},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        # A tick stream has no fixed expected cadence; nonempty is not proof of full coverage.
+        coverage_verified = kind == "bars" and bool(rows) and not gaps
+        if coverage_verified and timeframe is not None:
+            seconds = {"M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400, "D1": 86400}[
+                timeframe
+            ]
+            first = datetime.fromisoformat(rows[0]["time"])
+            last_close = datetime.fromisoformat(rows[-1]["closed_at"])
+            coverage_verified = first - since < timedelta(
+                seconds=seconds
+            ) and until - last_close < timedelta(seconds=seconds)
+        return {
+            "symbol": symbol,
+            "kind": kind,
+            "timeframe": timeframe,
+            "since": since.astimezone(UTC).isoformat(),
+            "until": until.astimezone(UTC).isoformat(),
+            "clock_offset_seconds": self._settings.server_time_offset_seconds,
+            "count": len(rows),
+            "first_at": rows[0]["time"] if rows else None,
+            "last_at": rows[-1]["time"] if rows else None,
+            "gaps": gaps,
+            "sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+            "coverage_verified": coverage_verified,
+            "complete": coverage_verified,
+            "rows": rows,
+        }
+
     def _server_timestamp(self, value: Any) -> datetime:
         normalized = _utc_timestamp(value) - timedelta(
             seconds=self._settings.server_time_offset_seconds
@@ -198,6 +378,12 @@ class MT5Service:
             "equity": _decimal(info.equity),
             "margin_free": _decimal(info.margin_free),
             "is_demo": getattr(info, "trade_mode", None) == demo_constant,
+            "hedging": (
+                getattr(info, "margin_mode", None)
+                == getattr(mt5, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2)
+            )
+            if getattr(info, "margin_mode", None) is not None
+            else None,
             "trade_allowed": bool(getattr(info, "trade_allowed", False))
             and bool(getattr(terminal, "trade_allowed", False)),
         }
@@ -210,6 +396,75 @@ class MT5Service:
         if info is None:
             raise ConnectorError(f"symbol is unavailable: {symbol}")
         return mt5, info
+
+    def profit_target(self, request: ProfitTargetRequest) -> dict[str, str]:
+        """Solve on broker ticks using order_calc_profit; never call order_send.
+
+        The result estimates gross profit at the proposed entry, excluding fees,
+        swaps and slippage. It is not a promise of realized profit.
+        """
+        with self._mutation_lock:
+            account = self.account(request.account_id)
+            if not account["is_demo"] or account["currency"] != "USD":
+                raise ConnectorError("USD profit targets require a USD demo account")
+            mt5, info = self._symbol_info(request.symbol.upper())
+            tick = _decimal(getattr(info, "trade_tick_size", 0))
+            step = _decimal(info.volume_step)
+            minimum, maximum = _decimal(info.volume_min), _decimal(info.volume_max)
+            if any(not value.is_finite() or value <= 0 for value in (tick, step, minimum, maximum)):
+                raise ConnectorError("invalid broker symbol specification")
+            if not minimum <= request.volume <= maximum or request.volume % step != 0:
+                raise ConnectorError("volume does not match broker limits or step")
+            if request.entry_price % tick != 0:
+                raise ConnectorError("entry price does not match broker tick size")
+            action = mt5.ORDER_TYPE_BUY if request.side == "buy" else mt5.ORDER_TYPE_SELL
+            direction = Decimal(1) if request.side == "buy" else Decimal(-1)
+            max_ticks = 10**12
+            if request.side == "sell":
+                max_ticks = min(max_ticks, int(request.entry_price / tick) - 1)
+            if max_ticks < 1:
+                raise ConnectorError("profit target cannot be represented by a positive price")
+
+            def calculate(ticks: int) -> tuple[Decimal, Decimal]:
+                price = request.entry_price + direction * tick * ticks
+                result = mt5.order_calc_profit(
+                    action,
+                    request.symbol.upper(),
+                    float(request.volume),
+                    float(request.entry_price),
+                    float(price),
+                )
+                if result is None:
+                    raise ConnectorError("broker profit calculation is unavailable")
+                profit = _decimal(result)
+                if not profit.is_finite() or profit <= 0:
+                    raise ConnectorError("broker returned an invalid gross profit estimate")
+                return price, profit
+
+            low, high = 0, 1
+            for _ in range(41):
+                _, profit = calculate(high)
+                if profit >= request.target_usd:
+                    break
+                low = high
+                if high == max_ticks:
+                    raise ConnectorError("profit target is outside supported price bounds")
+                high = min(high * 2, max_ticks)
+            else:
+                raise ConnectorError("profit target search exceeded its bound")
+            for _ in range(40):
+                if high - low <= 1:
+                    break
+                middle = (low + high) // 2
+                _, profit = calculate(middle)
+                if profit >= request.target_usd:
+                    high = middle
+                else:
+                    low = middle
+            price, profit = calculate(high)
+            if profit < request.target_usd:
+                raise ConnectorError("broker could not verify the gross profit target")
+            return {"take_profit": str(price), "estimated_gross_profit": str(profit)}
 
     def symbol(self, symbol: str) -> dict[str, Any]:
         mt5, info = self._symbol_info(symbol.upper())
@@ -333,6 +588,14 @@ class MT5Service:
         if protection_error:
             return mt5, {}, price, protection_error
         action, mt5_order_type = self._order_constants(mt5, instruction.side, order_type)
+        if (
+            instruction.requested_order_type is not None
+            and instruction.requested_order_type != order_type
+        ):
+            return mt5, {}, price, "requested order type must not change"
+        if instruction.pending_expires_at is not None:
+            if order_type == "market" or instruction.pending_expires_at <= datetime.now(UTC):
+                return mt5, {}, price, "invalid or expired pending-order expiry"
         request = {
             "action": action,
             "symbol": instruction.symbol,
@@ -348,9 +611,17 @@ class MT5Service:
         if order_type != "market":
             expiration_mode = int(getattr(info, "expiration_mode", 0))
             specified_flag = int(getattr(mt5, "SYMBOL_EXPIRATION_SPECIFIED", 4))
-            if instruction.deadline_at is not None and expiration_mode & specified_flag:
+            if instruction.pending_expires_at is not None and not expiration_mode & specified_flag:
+                return (
+                    mt5,
+                    {},
+                    price,
+                    "broker does not support the requested pending expiry; GTC was not substituted",
+                )
+            expiry = instruction.pending_expires_at or instruction.deadline_at
+            if expiry is not None and expiration_mode & specified_flag:
                 request["type_time"] = int(mt5.ORDER_TIME_SPECIFIED)
-                request["expiration"] = int(self._server_bound(instruction.deadline_at).timestamp())
+                request["expiration"] = int(self._server_bound(expiry).timestamp())
             else:
                 request["type_time"] = int(mt5.ORDER_TIME_GTC)
             request["type_filling"] = int(mt5.ORDER_FILLING_RETURN)

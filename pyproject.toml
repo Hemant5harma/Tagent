@@ -27,6 +27,7 @@ dev = ["pytest>=8.4,<9", "pytest-asyncio>=1.1,<2", "ruff>=0.12,<1", "mypy>=1.17,
 
 [project.scripts]
 trade-agent = "trade_agent.main:main"
+trade-agent-autonomy = "trade_agent.autonomy:main"
 
 [build-system]
 requires = ["hatchling>=1.27"]
@@ -34,6 +35,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trade_agent"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"third_party/TradingAgents" = "trade_agent/third_party/TradingAgents"
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "connector/tests"]

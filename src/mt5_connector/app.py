@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 
 from mt5_connector.contracts import (
     CancelRequest,
@@ -18,6 +18,7 @@ from mt5_connector.contracts import (
     ModifyRequest,
     MutationResponse,
     PreflightRequest,
+    ProfitTargetRequest,
     SubmissionResponse,
     SubmitOrderRequest,
 )
@@ -137,6 +138,13 @@ def create_app(
         except ConnectorError as exc:
             raise connector_error(exc) from exc
 
+    @app.post("/v1/profit-target", dependencies=[Depends(authorize)])
+    def profit_target(request: ProfitTargetRequest) -> dict[str, str]:
+        try:
+            return service.profit_target(request)
+        except ConnectorError as exc:
+            raise connector_error(exc) from exc
+
     @app.get("/v1/accounts/{account_id}", dependencies=[Depends(authorize)])
     def account(account_id: str) -> dict[str, Any]:
         try:
@@ -155,6 +163,31 @@ def create_app(
     def quote(symbol: str) -> dict[str, Any]:
         try:
             return service.quote(symbol)
+        except ConnectorError as exc:
+            raise connector_error(exc) from exc
+
+    @app.get("/v1/bars/{symbol}", dependencies=[Depends(authorize)])
+    def bars(
+        symbol: str, timeframe: str = "M15", count: int = Query(200, ge=50, le=1000)
+    ) -> dict[str, Any]:
+        try:
+            return {"bars": service.bars(symbol, timeframe, count)}
+        except ConnectorError as exc:
+            raise connector_error(exc) from exc
+
+    @app.get("/v1/research/bars/{symbol}", dependencies=[Depends(authorize)])
+    def historical_bars(
+        symbol: str, since: datetime, until: datetime, timeframe: str = "M15"
+    ) -> dict[str, Any]:
+        try:
+            return service.historical_bars(symbol, timeframe, since, until)
+        except ConnectorError as exc:
+            raise connector_error(exc) from exc
+
+    @app.get("/v1/research/ticks/{symbol}", dependencies=[Depends(authorize)])
+    def historical_ticks(symbol: str, since: datetime, until: datetime) -> dict[str, Any]:
+        try:
+            return service.historical_ticks(symbol, since, until)
         except ConnectorError as exc:
             raise connector_error(exc) from exc
 

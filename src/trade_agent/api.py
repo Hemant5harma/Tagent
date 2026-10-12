@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from trade_agent.app import ApplicationFacade
+from trade_agent.autonomy_policy import GrantRequest
 from trade_agent.domain import Side, TradeInstruction
 from trade_agent.risk import RiskRejected
 from trade_agent.service import ProposalError
@@ -56,6 +57,16 @@ class ProtectionProposalRequest(BaseModel):
     take_profit: Decimal = Field(gt=0)
 
 
+class ResearchRunRequest(BaseModel):
+    owner_id: str
+    symbol: str
+    mode: str = "shadow"
+
+
+class AutonomyOwnerRequest(BaseModel):
+    owner_id: str
+
+
 def create_api(facade: ApplicationFacade, worker: TradeWorker | None = None) -> FastAPI:
     def require_api_access(request: Request) -> None:
         expected = getattr(facade.settings, "http_api_token", None)
@@ -89,6 +100,39 @@ def create_api(facade: ApplicationFacade, worker: TradeWorker | None = None) -> 
                 await worker.stop()
 
     app = FastAPI(title="Trade Agent", version="0.1.0", lifespan=lifespan)
+
+    from trade_agent.autonomy import AutonomyController
+
+    autonomy = AutonomyController(facade.service)
+
+    @app.get("/v1/autonomy/status", dependencies=[Depends(require_api_access)])
+    def autonomy_status() -> dict:
+        return autonomy.status()
+
+    @app.get("/v1/autonomy/runs", dependencies=[Depends(require_api_access)])
+    def autonomy_runs(limit: int = 30) -> list[dict]:
+        return autonomy.runs(limit)
+
+    @app.post("/v1/autonomy/run", dependencies=[Depends(require_api_access)])
+    async def autonomy_run(request: ResearchRunRequest) -> dict:
+        require_owner(request.owner_id)
+        try:
+            return await autonomy.run(request.owner_id, request.symbol, mode=request.mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/autonomy/grants", dependencies=[Depends(require_api_access)])
+    def autonomy_grant(request: GrantRequest) -> dict:
+        require_owner(request.owner_id)
+        try:
+            return autonomy.create_grant(request)
+        except (ValueError, RiskRejected) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/v1/autonomy/revoke", dependencies=[Depends(require_api_access)])
+    def autonomy_revoke(request: AutonomyOwnerRequest) -> dict:
+        require_owner(request.owner_id)
+        return autonomy.revoke(request.owner_id)
 
     def fail(exc: Exception) -> HTTPException:
         return HTTPException(status_code=400, detail=str(exc))

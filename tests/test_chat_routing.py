@@ -10,7 +10,7 @@ from trade_agent.ai import AIBackendResponseError, ParsedEntry, TradeProposalPar
 from trade_agent.app import ApplicationFacade, TelegramApplicationFacade
 from trade_agent.broker import FakeBroker
 from trade_agent.config import Settings
-from trade_agent.db import Database, ProposalRecord
+from trade_agent.db import BrokerDealRecord, Database, ExecutionIntentRecord, ProposalRecord
 from trade_agent.delivery import current_update_id
 from trade_agent.domain import PositionSnapshot, Side
 from trade_agent.service import TradeService
@@ -106,6 +106,100 @@ async def test_open_trades_question_reports_actual_position_not_model_guess(chat
         assert "4321" in reply.text and "XAUUSD" in reply.text and "-3.25" in reply.text
         assert backend.parsed_messages == [] and backend.explained_messages == []
         assert len(app.application.service.broker._positions) == 1
+    finally:
+        await app.aclose()
+
+
+async def test_this_order_uses_latest_owner_submission_and_live_broker_state(chat):
+    app, backend = chat
+    service = app.application.service
+    moment = datetime.now(UTC)
+    service.broker._positions["111111"] = PositionSnapshot(
+        position_id="111111", symbol="XAUUSD", side=Side.BUY,
+        volume=Decimal("0.10"), entry_price=Decimal("4100"),
+        stop_loss=None, take_profit=None, profit=Decimal("-5"), opened_at=moment,
+    )
+    service.broker._positions["2114602370"] = PositionSnapshot(
+        position_id="2114602370", symbol="XAUUSD", side=Side.SELL,
+        volume=Decimal("0.05"), entry_price=Decimal("4154.86"),
+        stop_loss=Decimal("4156.65"), take_profit=Decimal("4152.86"),
+        profit=Decimal("1.25"), opened_at=moment,
+    )
+    with service.database.session() as session:
+        session.add(ProposalRecord(
+            id="proposal-1", owner_id="100", account_id=app.application.settings.account_id,
+            version=1, status="submitted", instruction={}, validation={},
+            order_type="market", confirmation_token="token-1", expires_at=moment,
+            deadline_at=None, created_at=moment, updated_at=moment, source_update_id=None,
+        ))
+        session.add(ExecutionIntentRecord(
+            id="intent-1", proposal_id="proposal-1", idempotency_key="key-1",
+            status="filled", broker_order_id="2114602370", broker_deal_id="123",
+            broker_position_id="2114602370", result={}, created_at=moment, updated_at=moment,
+        ))
+    try:
+        reply = await app.create_trade_from_text(owner_id="100", text="tell me about this order")
+        assert "Position #2114602370 · OPEN" in reply.text
+        assert "SL 4156.65 · TP 4152.86" in reply.text
+        assert "Current floating P/L: 1.25" in reply.text
+        assert "111111" not in reply.text
+        assert backend.parsed_messages == backend.explained_messages == []
+    finally:
+        await app.aclose()
+
+
+async def test_chat_provider_outage_does_not_deny_prior_trade(chat):
+    app, backend = chat
+
+    async def unavailable(*_):
+        raise AIBackendResponseError("provider unavailable")
+
+    backend.explain = unavailable
+    try:
+        reply = await app.create_trade_from_text(owner_id="100", text="how are broker spreads calculated?")
+        assert "temporarily unavailable" in reply.text
+        assert "previously confirmed trades are unaffected" in reply.text
+        assert "No trade was submitted" not in reply.text
+    finally:
+        await app.aclose()
+
+
+async def test_closed_trade_uses_complete_broker_deal_lifecycle(chat):
+    app, backend = chat
+    moment = datetime.now(UTC)
+    account_id = app.application.settings.account_id
+    with app.application.service.database.session() as session:
+        session.add(ProposalRecord(
+            id="proposal-closed", owner_id="100", account_id=account_id,
+            version=1, status="submitted", instruction={}, validation={},
+            order_type="market", confirmation_token="token-closed", expires_at=moment,
+            deadline_at=None, created_at=moment, updated_at=moment, source_update_id=None,
+        ))
+        session.add(ExecutionIntentRecord(
+            id="intent-closed", proposal_id="proposal-closed", idempotency_key="key-closed",
+            status="closed", broker_order_id="2114602370", broker_deal_id="1",
+            broker_position_id="2114602370", result={}, created_at=moment, updated_at=moment,
+        ))
+        for ticket, entry, price, profit in (
+            ("1", "0", "4154.86", "0"), ("2", "1", "4152.86", "10"),
+        ):
+            session.add(BrokerDealRecord(
+                id=f"{account_id}:{ticket}", account_id=account_id,
+                position_id="2114602370", occurred_at=moment,
+                payload={
+                    "ticket": ticket, "position_id": "2114602370", "symbol": "XAUUSD",
+                    "type": "1", "entry": entry, "volume": "0.05", "price": price,
+                    "profit": profit, "commission": "-0.50" if entry == "1" else "0",
+                    "swap": "0", "fee": "0", "magic": "123",
+                    "time": str(int(moment.timestamp())),
+                    "time_msc": str(int(moment.timestamp() * 1000) + int(ticket)),
+                },
+            ))
+    try:
+        reply = await app.create_trade_from_text(owner_id="100", text="tell me about this order")
+        assert "CLOSED (broker-deal history)" in reply.text
+        assert "Realized P/L after recorded costs: 9.50" in reply.text
+        assert backend.parsed_messages == backend.explained_messages == []
     finally:
         await app.aclose()
 

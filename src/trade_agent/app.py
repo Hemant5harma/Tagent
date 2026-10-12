@@ -7,7 +7,7 @@ import json
 import re
 import time
 from dataclasses import asdict
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -16,10 +16,16 @@ from sqlalchemy import select
 
 from trade_agent.ai import ParsedEntry, TradeProposalParse, build_ai_backend
 from trade_agent.config import Settings
-from trade_agent.db import DashboardCacheRecord, IncomingUpdateRecord, ProposalRecord
+from trade_agent.db import (
+    BrokerDealRecord,
+    DashboardCacheRecord,
+    ExecutionIntentRecord,
+    IncomingUpdateRecord,
+    ProposalRecord,
+)
 from trade_agent.delivery import current_update_id
-from trade_agent.domain import ProposalView, Side, TradeInstruction
-from trade_agent.reporting import activity, now, put_cache
+from trade_agent.domain import OrderType, ProposalView, Side, TradeInstruction
+from trade_agent.reporting import activity, closed_trades, now, put_cache
 from trade_agent.service import ProposalError, TradeService
 from trade_agent.workflow import ConversationRunner
 
@@ -37,6 +43,13 @@ def _read_only_route(text: str) -> str | None:
     Action words take precedence: a question phrased as "can you buy" is still
     an instruction candidate, never a read-only account query.
     """
+    if re.fullmatch(
+        r"(?:(?:please )?(?:tell me about|show|explain|describe) |(?:what happened to|what is the status of) )"
+        r"(?:(?:my|the|this|that) )?(?:(?:last|latest|recent) )?"
+        r"(?:trade|order|position)(?: #?\d+)?",
+        text,
+    ):
+        return "trade_detail"
     if re.match(
         r"(?:explain|define)\b|what (?:is|does) (?:a |an |the )?(?:balance|equity|free margin)\b",
         text,
@@ -158,13 +171,34 @@ def format_proposal(proposal: ProposalView) -> str:
     trade = proposal.instruction
     entry = "market" if trade.entry_price is None else str(trade.entry_price)
     deadline = f"\nDeadline: {trade.deadline_at.isoformat()}" if trade.deadline_at else ""
+    if trade.entry_price is not None:
+        deadline += "\nUnfilled order expiry: " + (
+            trade.pending_expires_at.isoformat()
+            if trade.pending_expires_at
+            else "until cancelled (GTC)"
+        )
+        deadline += ". This expiry does not close a filled position."
+    target = (
+        f"USD profit target: ${trade.profit_target_usd}; estimated gross at TP ${trade.estimated_gross_profit}. "
+        "The TP price above is fixed for this approval. Fees, slippage and conversion changes affect realized profit.\n"
+        if trade.profit_target_usd is not None
+        else ""
+    )
+    market_note = (
+        "Market quote may move. If the approved quote tolerance or risk cap is exceeded, no order is sent; review a fresh proposal.\n"
+        if trade.auto_market_protection
+        else ""
+    )
     return (
         f"Confirm trade\n"
         f"Account {trade.account_id} · {'DEMO' if proposal.validation.get('account_is_demo') else 'LIVE'}\n"
         f"{trade.side.value.upper()} {trade.symbol} · {trade.volume} lots\n"
         f"Order: {proposal.order_type.value} · entry {entry}\n"
         f"SL {trade.stop_loss} · TP {trade.take_profit}{deadline}\n"
-        f"Current bid/ask: {proposal.validation['bid']} / {proposal.validation['ask']}\n"
+        + (f"Proposal assumptions: {trade.note}\n" if trade.note else "")
+        + f"{target}"
+        + market_note
+        + f"Current bid/ask: {proposal.validation['bid']} / {proposal.validation['ask']}\n"
         f"Estimated loss at SL: {proposal.validation.get('estimated_loss', 'unavailable')} {proposal.validation.get('currency', '')}\n"
         f"Estimated margin: {proposal.validation.get('estimated_margin', 'unavailable')}\n"
         "Stops do not guarantee a maximum loss.\n"
@@ -246,6 +280,84 @@ class ApplicationFacade:
             for item in positions
         )
 
+    def trade_detail_text(self, owner_id: str, text: str) -> str:
+        """Read current broker state for a ticket or the owner's latest submitted trade."""
+        state = self.service.broker_state()
+        account = state["account"]
+        requested_id = next(iter(re.findall(r"\b\d{6,}\b", text)), None)
+        with self.service.database.session() as session:
+            latest = session.scalar(
+                select(ExecutionIntentRecord)
+                .join(ProposalRecord, ExecutionIntentRecord.proposal_id == ProposalRecord.id)
+                .where(
+                    ProposalRecord.owner_id == owner_id,
+                    ProposalRecord.account_id == self.settings.account_id,
+                    ExecutionIntentRecord.broker_order_id.is_not(None),
+                )
+                .order_by(ExecutionIntentRecord.created_at.desc())
+            )
+            ticket = requested_id or (
+                latest.broker_position_id or latest.broker_order_id if latest else None
+            )
+            last_outcome = latest.status if latest else None
+            deals = (
+                [
+                    row.payload
+                    for row in session.scalars(
+                        select(BrokerDealRecord).where(
+                            BrokerDealRecord.account_id == self.settings.account_id,
+                            BrokerDealRecord.position_id == ticket,
+                        )
+                    )
+                ]
+                if ticket
+                else []
+            )
+        if not ticket:
+            return "I have no submitted trade to identify. Send a broker ticket number or use /positions and /orders."
+        prefix = f"Account {account['account_id']} · {'DEMO' if account['is_demo'] else 'LIVE'}\n"
+        for position in state["state"]["positions"]:
+            if str(position["position_id"]) == ticket:
+                return (
+                    prefix
+                    + f"Position #{ticket} · OPEN\n"
+                    + f"{position['side'].upper()} {position['symbol']} · {position['volume']} lots\n"
+                    + f"Entry {position['entry_price']} · SL {position['stop_loss'] or 'not set'} · TP {position['take_profit'] or 'not set'}\n"
+                    + f"Current floating P/L: {position['profit']} {account['currency']}\n"
+                    + "This is a live broker-state check. No new trade was placed."
+                )
+        for order in state["state"]["orders"]:
+            if str(order["order_id"]) == ticket:
+                return (
+                    prefix
+                    + f"Order #{ticket} · PENDING ({order['status']})\n"
+                    + f"{order['side'].upper()} {order['symbol']} · {order['volume']} lots @ {order['entry_price']}\n"
+                    + f"SL {order['stop_loss'] or 'not set'} · TP {order['take_profit'] or 'not set'}\n"
+                    + "This is a live broker-state check. No new trade was placed."
+                )
+        verified_closures = closed_trades(deals, {ticket}, set())
+        if verified_closures:
+            trade = verified_closures[0]
+            return (
+                prefix
+                + f"Position #{ticket} · CLOSED (broker-deal history)\n"
+                + f"{trade['side'].upper()} {trade['symbol']} · {trade['volume']} lots\n"
+                + f"Entry {trade['entry_price']} · Exit {trade['exit_price']}\n"
+                + f"Realized P/L after recorded costs: {trade['net_pnl']} {account['currency']} "
+                + f"(costs {trade['costs']})\n"
+                + f"Closed {trade['closed_at']}. No new trade was placed."
+            )
+        if requested_id:
+            return (
+                prefix + f"Ticket #{ticket} is not among current open positions or pending orders. "
+                "It may have closed or been cancelled; check broker history before treating that as confirmed. No new trade was placed."
+            )
+        return (
+            prefix + f"The latest submission was recorded as {last_outcome} (ticket #{ticket}). "
+            "It is not among current open positions or pending orders. Check broker history for its final outcome. "
+            "No new trade was placed."
+        )
+
     def status_text(self) -> str:
         state = self.service.broker_state()
         return (
@@ -307,19 +419,91 @@ class TelegramApplicationFacade:
         return None
 
     async def queue_reply(self, update_id: str, reply: TelegramReply) -> None:
+        from trade_agent.memory import remember
+
         with self.application.service.database.session() as session:
             row = session.get(IncomingUpdateRecord, update_id)
             if row:
+                payload = row.payload or {}
+                user_text = str((payload.get("message") or {}).get("text") or "")
+                command = (
+                    user_text.strip().split(maxsplit=1)[0].split("@")[0]
+                    if user_text.strip()
+                    else ""
+                )
+                if (
+                    user_text
+                    and command not in {"/dashboard", "/memory", "/forget"}
+                    and "One-use login code:" not in reply.text
+                ):
+                    remember(
+                        session,
+                        self._memory_owner(row.owner_id),
+                        update_id,
+                        user_text,
+                        reply.text,
+                        self._memory_secrets(),
+                    )
                 row.reply = asdict(reply)
                 row.status = "completed"
                 row.completed_at = now()
+
+    def _memory_owner(self, owner_id: str) -> str:
+        return f"{self.application.settings.account_id}:{owner_id}"
+
+    def _memory_secrets(self) -> tuple[str, ...]:
+        settings = self.application.settings
+        return tuple(
+            value
+            for value in (
+                settings.telegram_bot_token,
+                settings.openai_api_key,
+                settings.mt5_connector_token,
+                settings.http_api_token,
+                settings.database_url,
+            )
+            if value
+        )
+
+    async def memory(self, *, owner_id: str) -> TelegramReply:
+        from trade_agent.memory import context
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        saved = context(
+            self.application.service.database, self._memory_owner(owner_id), self._memory_secrets()
+        )
+        return TelegramReply(
+            "Conversation memory (bounded historical context, not trade permission):\n"
+            + json.dumps(saved, ensure_ascii=False, indent=2)[:3000]
+            + "\nDisplay limited to 3000 characters. /forget clears conversation memory; /new clears only your trade draft."
+        )
+
+    async def forget(self, *, owner_id: str) -> TelegramReply:
+        from trade_agent.memory import forget
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        forget(self.application.service.database, self._memory_owner(owner_id))
+        return TelegramReply(
+            "Conversation memory cleared. The trading audit and current trade draft are separate and remain. Use /new to clear the draft too. No broker orders or positions were changed."
+        )
 
     async def help(self, *, owner_id: str) -> TelegramReply:
         from trade_agent.telegram import TelegramReply
 
         self._authorize(owner_id)
+        defaults = (
+            " Missing entry defaults to a proposed market order; missing SL is calculated within the $10 estimated-risk cap. Review the exact prices before confirming."
+            if self.application.settings.auto_demo_protection
+            else " Please provide entry and SL."
+        )
         return TelegramReply(
-            "Hi! I can help you prepare a Vantage MT5 demo trade, check your account, and explain the trading workflow. You choose the trade; I ask for missing details, then show one Confirm trade button.\n\nSend: buy/sell, symbol, lot size, entry market or price, SL and TP. I never invent missing values.\n\n/account /positions /orders /status /pause\n/new /cancel_draft /dashboard\n/close <position-id> prepares a confirmed full close. Autonomous trading is off."
+            "I can prepare Vantage MT5 demo trades, check your account, and explain the workflow. Send buy/sell, symbol, lots and a TP price or USD profit target. SL is mandatory."
+            + defaults
+            + " Allowed symbols: "
+            + ", ".join(self.application.settings.allowed_symbols)
+            + ". One Confirm trade button in Telegram authorizes the exact proposal, subject to entry pause and risk limits.\n\nPending example: sell limit at 4250 XAUUSD 0.05 lots target $10 profit expires in 2 hours. The broker holds accepted pending orders; /pause does not cancel them. Expiry cancels an unfilled order, not a filled position.\n\n/account /positions /orders /status /pause\n/new /cancel_draft /dashboard\n/autonomy /decisions /diagnostics /performance manual|autonomous|all\n/memory /forget\n/cancel_order <order-id> prepares a confirmed pending-order cancellation.\n/close <position-id> prepares a confirmed full close. Check /autonomy for configured mode, worker heartbeat and grant. The dashboard is read-only."
         )
 
     async def reset_draft(self, *, owner_id: str) -> TelegramReply:
@@ -427,8 +611,13 @@ class TelegramApplicationFacade:
             return await routes[normalized](owner_id=owner_id)
         read_only_route = _read_only_route(normalized)
         if read_only_route:
+            if read_only_route == "trade_detail":
+                return await self.trade_detail(owner_id=owner_id, text=normalized)
             return await getattr(self, read_only_route)(owner_id=owner_id)
-        if normalized in {
+        if re.fullmatch(
+            r"(?:(?:okay|ok|yes|please)[,\s]+)*(?:open|execute|place|confirm)\s+(?:(?:this|that|the)\s+)?(?:trade|order|it)(?:\s+(?:now|please))?[.!?]*",
+            normalized,
+        ) or normalized in {
             "yes",
             "yes please",
             "confirm",
@@ -438,6 +627,11 @@ class TelegramApplicationFacade:
             "okay",
             "ok",
         }:
+            from trade_agent.entry_readiness import blocker_message, entry_blockers
+
+            blockers = await asyncio.to_thread(entry_blockers, self.application.service)
+            if blockers:
+                return TelegramReply(blocker_message(blockers))
             return TelegramReply(
                 "Text replies do not authorize an order. Use the Confirm trade button on the exact proposal you reviewed, or send the missing trade details. No trade was submitted."
             )
@@ -458,7 +652,12 @@ class TelegramApplicationFacade:
                     )
         started = time.monotonic()
         try:
-            if _looks_like_trade_request(normalized):
+            from trade_agent.workflow import is_draft_followup
+
+            draft = await self._conversation.current(owner_id)
+            if _looks_like_trade_request(normalized) or (
+                draft.get("stage") == "clarifying" and is_draft_followup(text)
+            ):
                 outcome = await self._conversation.run(owner_id, text)
             else:
                 # Ordinary conversation must not depend on structured trade
@@ -500,13 +699,35 @@ class TelegramApplicationFacade:
                             "masked_account_id": "***" + str(account.get("account_id", ""))[-4:],
                             "state": snapshot.get("state", {}),
                             "entries_paused": snapshot.get("paused", True),
+                            "policy": {
+                                "allowed_entry_symbols": self.application.settings.allowed_symbols,
+                                "stop_loss_required": True,
+                                "auto_demo_protection": self.application.settings.auto_demo_protection,
+                                "automatic_sl_risk_cap_usd": str(
+                                    min(Decimal("10"), self.application.settings.max_estimated_loss)
+                                ),
+                                "confirmation_channel": "private Telegram buttons only",
+                                "dashboard": "read-only; no trading controls",
+                            },
+                            "active_draft": draft.get("parsed")
+                            if draft.get("stage") == "clarifying"
+                            else None,
                         }
+                    from trade_agent.memory import context
+
+                    evidence["conversation_memory"] = context(
+                        self.application.service.database,
+                        self._memory_owner(owner_id),
+                        self._memory_secrets(),
+                    )
                     try:
                         outcome["response"] = await backend.explain(text, json.dumps(evidence))
                     except AIBackendError:
                         outcome["stage"] = "failed"
                         outcome["response"] = (
-                            "The assistant is temporarily unavailable. /account, /status and /pause still work. No trade was submitted."
+                            "The conversational assistant is temporarily unavailable. "
+                            "This message made no broker changes; previously confirmed trades are unaffected. "
+                            "Use /positions, /orders or /status for verified broker data."
                         )
             elapsed = int((time.monotonic() - started) * 1000)
             activity(
@@ -525,12 +746,46 @@ class TelegramApplicationFacade:
                     or self.application.settings.ai_provider,
                 },
             )
+            if (
+                self.application.settings.auto_demo_protection
+                and outcome["stage"] == "clarifying"
+                and outcome["parsed"]
+                and outcome["parsed"].get("intent") == "trade"
+                and not outcome["parsed"].get("clarification")
+                and set(outcome["requires_trade_fields"]) <= {"entry", "stop_loss"}
+            ):
+                if outcome["parsed"].get("entry", {}).get("kind") == "missing" and re.search(
+                    r"\b(?:limit|pending|stop\s+order|when|wait)\b", text, re.I
+                ):
+                    return TelegramReply(
+                        "Please give the intended pending entry price; I won't replace a pending/conditional instruction with a market order."
+                    )
+                outcome["stage"] = "ready_for_confirmation"
             if outcome["stage"] != "ready_for_confirmation" or outcome["parsed"] is None:
-                return TelegramReply(outcome["response"])
-            instruction = self._instruction_from_parse(owner_id, outcome["parsed"])
-            proposal = await asyncio.to_thread(
-                self.application.service.create_proposal, instruction
-            )
+                response = outcome["response"]
+                parsed_draft = outcome.get("parsed") or {}
+                if (
+                    parsed_draft.get("symbol")
+                    and parsed_draft["symbol"] not in self.application.settings.allowed_symbols
+                ):
+                    response += (
+                        "\nThat symbol is outside the approved entry allowlist: "
+                        + ", ".join(self.application.settings.allowed_symbols)
+                        + ". No order can be prepared for it under current limits."
+                    )
+                if (
+                    outcome["stage"] == "clarifying"
+                    and "stop_loss" in outcome["requires_trade_fields"]
+                ):
+                    response += "\nA stop-loss price is mandatory under the current rules; I cannot omit it. Confirmations happen only in Telegram, never on the read-only dashboard."
+                return TelegramReply(response)
+            from trade_agent.entry_readiness import blocker_message, entry_blockers
+
+            blockers = await asyncio.to_thread(entry_blockers, self.application.service)
+            if blockers:
+                return TelegramReply(blocker_message(blockers))
+            proposal = await self._prepare_trade_proposal(owner_id, outcome["parsed"])
+            await self._conversation.reset(owner_id)
             return TelegramReply(
                 format_proposal(proposal),
                 confirmation_token=proposal.confirmation_token,
@@ -569,16 +824,83 @@ class TelegramApplicationFacade:
         self, owner_id: str, payload: dict[str, object]
     ) -> TradeInstruction:
         parsed = TradeProposalParse.model_validate(payload)
+        auto_market = (
+            self.application.settings.auto_demo_protection
+            and parsed.entry.kind in {"missing", "market"}
+            and parsed.stop_loss is None
+        )
+        from trade_agent.auto_protection import complete_protection
+
+        parsed = complete_protection(
+            parsed, self.application.settings, self.application.service.broker
+        )
         if (
             parsed.symbol is None
             or parsed.side is None
             or parsed.volume is None
             or parsed.stop_loss is None
-            or parsed.take_profit is None
+            or (parsed.take_profit is None and parsed.profit_target_usd is None)
             or parsed.entry.kind == "missing"
         ):
             raise InputIncomplete("AI parser did not return all required explicit trade details")
         entry_price = parsed.entry.price if parsed.entry.kind == "price" else None
+        take_profit = parsed.take_profit
+        estimated_profit = None
+        if parsed.profit_target_usd is not None:
+            settings = self.application.settings
+            broker = self.application.service.broker
+            if settings.trading_mode != "demo" or parsed.symbol not in settings.allowed_symbols:
+                raise InputIncomplete(
+                    "USD targets require an allowed symbol on the configured demo account"
+                )
+            account = broker.account(settings.account_id)
+            if (
+                not account.is_demo
+                or account.account_id != settings.account_id
+                or account.currency != "USD"
+            ):
+                raise InputIncomplete("USD profit targets require the configured USD demo account")
+            quote = broker.quote(parsed.symbol)
+            observed = (
+                quote.observed_at.replace(tzinfo=UTC)
+                if quote.observed_at.tzinfo is None
+                else quote.observed_at
+            )
+            age = (datetime.now(UTC) - observed).total_seconds()
+            if age < -5 or age > settings.max_quote_age_seconds:
+                raise InputIncomplete("A fresh broker quote is required to calculate the TP price")
+            reference = (
+                entry_price
+                if entry_price is not None
+                else (quote.ask if parsed.side == "buy" else quote.bid)
+            )
+            from trade_agent.broker import BrokerUnavailable
+
+            try:
+                calculation = broker.profit_target(
+                    settings.account_id,
+                    parsed.symbol,
+                    Side(parsed.side),
+                    parsed.volume,
+                    reference,
+                    parsed.profit_target_usd,
+                )
+            except BrokerUnavailable as exc:
+                raise InputIncomplete(
+                    "The broker profit calculator is unavailable; please retry later. No trade was submitted."
+                ) from exc
+            take_profit = Decimal(calculation["take_profit"])
+            estimated_profit = Decimal(calculation["estimated_gross_profit"])
+            if (
+                not take_profit.is_finite()
+                or take_profit <= 0
+                or not estimated_profit.is_finite()
+                or estimated_profit <= 0
+                or (parsed.side == "buy" and take_profit <= reference)
+                or (parsed.side == "sell" and take_profit >= reference)
+            ):
+                raise InputIncomplete("The broker returned an invalid profit-target calculation")
+        assert take_profit is not None
         deadline_at = (
             datetime.fromisoformat(parsed.deadline_at.replace("Z", "+00:00"))
             if parsed.deadline_at is not None
@@ -592,10 +914,45 @@ class TelegramApplicationFacade:
             volume=parsed.volume,
             entry_price=entry_price,
             stop_loss=parsed.stop_loss,
-            take_profit=parsed.take_profit,
+            take_profit=take_profit,
+            profit_target_usd=parsed.profit_target_usd,
+            estimated_gross_profit=estimated_profit,
+            auto_market_protection=auto_market,
             deadline_at=deadline_at,
+            pending_expires_at=datetime.fromisoformat(
+                parsed.pending_expires_at.replace("Z", "+00:00")
+            )
+            if parsed.pending_expires_at
+            else None,
+            requested_order_type=OrderType(parsed.requested_order_type)
+            if parsed.requested_order_type
+            else None,
             note=parsed.note,
         )
+
+    async def _prepare_trade_proposal(
+        self, owner_id: str, payload: dict[str, object]
+    ) -> ProposalView:
+        from trade_agent.risk import RiskRejected
+
+        last_error: ValueError | None = None
+        for _ in range(3):
+            instruction = await asyncio.to_thread(self._instruction_from_parse, owner_id, payload)
+            try:
+                return await asyncio.to_thread(
+                    self.application.service.create_proposal, instruction
+                )
+            except RiskRejected as exc:
+                if not instruction.auto_market_protection or str(exc) not in {
+                    "estimated stop-loss amount exceeds configured maximum",
+                    "SL/TP direction is invalid for current trade reference price",
+                    "SL or TP is closer than the broker minimum stop distance",
+                }:
+                    raise
+                last_error = exc
+        raise InputIncomplete(
+            "Gold moved while prices were being calculated. No order was sent. Please retry in a calmer moment or choose a pending entry price."
+        ) from last_error
 
     async def aclose(self) -> None:
         await self._conversation.aclose()
@@ -618,17 +975,82 @@ class TelegramApplicationFacade:
         self._authorize(owner_id)
         return TelegramReply(await asyncio.to_thread(self.application.positions_text))
 
+    async def trade_detail(self, *, owner_id: str, text: str) -> TelegramReply:
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        return TelegramReply(
+            await asyncio.to_thread(self.application.trade_detail_text, owner_id, text)
+        )
+
     async def status(self, *, owner_id: str) -> TelegramReply:
         from trade_agent.telegram import TelegramReply
 
         self._authorize(owner_id)
-        return TelegramReply(await asyncio.to_thread(self.application.status_text))
+        from trade_agent.entry_readiness import blocker_message, entry_blockers
+
+        text = await asyncio.to_thread(self.application.status_text)
+        blockers = await asyncio.to_thread(entry_blockers, self.application.service)
+        return TelegramReply(text + ("\n\n" + blocker_message(blockers) if blockers else ""))
 
     async def pause_entries(self, *, owner_id: str) -> TelegramReply:
         from trade_agent.telegram import TelegramReply
 
         self._authorize(owner_id)
         return TelegramReply(self.application.pause_entries())
+
+    async def autonomy(self, *, owner_id: str) -> TelegramReply:
+        from trade_agent.autonomy import AutonomyController
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        status = await asyncio.to_thread(AutonomyController(self.application.service).status)
+        grant = status["active_grant"]
+        worker = status["worker"]
+        return TelegramReply(
+            f"Autonomy mode: {status['mode']}\nWorker: {worker['state']}\n"
+            f"Heartbeat: {worker.get('observed_at') or 'never observed'}\n"
+            f"Strategy: {status['strategy_version']} · {status['timeframe']}\n"
+            f"Symbols: {', '.join(status['symbols'])}\n"
+            f"New entries: {'paused' if status['entries_paused'] else 'subject to risk checks'}\n"
+            f"Demo grant: {('expires ' + grant['expires_at']) if grant else 'none'}\n"
+            + "".join(
+                f"{item['symbol']} data: {item['status']} · {item['reason']}\n"
+                for item in status.get("market_data", [])
+            )
+            + "Shadow sends no orders. A heartbeat does not prove broker/model readiness."
+        )
+
+    async def performance(self, *, owner_id: str, scope: str = "all") -> TelegramReply:
+        from trade_agent.monitoring import performance_text
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        return TelegramReply(
+            await asyncio.to_thread(performance_text, self.application.service.database, scope)
+        )
+
+    async def decisions(self, *, owner_id: str) -> TelegramReply:
+        from trade_agent.autonomy import AutonomyController
+        from trade_agent.monitoring import decisions_text
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        runs = await asyncio.to_thread(AutonomyController(self.application.service).runs, 5)
+        return TelegramReply(decisions_text(runs))
+
+    async def diagnostics(self, *, owner_id: str) -> TelegramReply:
+        from trade_agent.monitoring import diagnostics_text
+        from trade_agent.telegram import TelegramReply
+
+        self._authorize(owner_id)
+        return TelegramReply(
+            await asyncio.to_thread(
+                diagnostics_text,
+                self.application.service.database,
+                self.application.settings.account_id,
+            )
+        )
 
     async def resume_entries(self, *, owner_id: str) -> TelegramReply:
         from trade_agent.telegram import TelegramReply
@@ -687,6 +1109,42 @@ class TelegramApplicationFacade:
                 proposal.version,
                 confirmation_token,
             )
+            if (
+                result.get("status") == "rejected"
+                and proposal.instruction.auto_market_protection
+                and result.get("message")
+                in {
+                    "estimated stop-loss amount exceeds configured maximum",
+                    "quote moved beyond approved tolerance; create a fresh proposal",
+                    "SL/TP direction is invalid for current trade reference price",
+                    "SL or TP is closer than the broker minimum stop distance",
+                }
+            ):
+                from trade_agent.entry_readiness import entry_blockers
+
+                if not await asyncio.to_thread(entry_blockers, self.application.service):
+                    original = proposal.instruction
+                    fresh_parse = TradeProposalParse(
+                        intent="trade",
+                        symbol=original.symbol,
+                        side=original.side.value,
+                        volume=original.volume,
+                        entry=ParsedEntry(kind="missing"),
+                        profit_target_usd=original.profit_target_usd,
+                    )
+                    try:
+                        fresh = await self._prepare_trade_proposal(
+                            owner_id, fresh_parse.model_dump()
+                        )
+                    except (InputIncomplete, ValueError):
+                        pass
+                    else:
+                        return TelegramReply(
+                            "The quote changed after your tap, so that order was not sent. Review this fresh proposal and confirm its new prices:\n\n"
+                            + format_proposal(fresh),
+                            confirmation_token=fresh.confirmation_token,
+                            confirmation_kind="trade",
+                        )
             return TelegramReply(result.get("message") or f"Trade {result['status']}.")
         except ProposalError as exc:
             return TelegramReply(f"Confirmation was not accepted: {exc}")

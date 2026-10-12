@@ -241,3 +241,38 @@ Before a planned shutdown, pause entries, wait for any submission in progress to
 settle, check the outbox and active deadline jobs, then stop the connector before
 the backend. On unplanned recovery, start the connector first and permit the
 backend to reconcile before accepting a new confirmed trade.
+
+## Owner-approved new Vantage demo evaluation
+
+Use `deploy/start_demo_evaluation.py` only after the owner explicitly approves
+archiving a **specific breached evaluation** and starting a fresh demo baseline.
+It is an operator tool, not a Telegram command or a way for the AI to override a
+loss stop. It requires the accepted USD Vantage MT5 demo deployment, PostgreSQL,
+five total exposures, the $20 estimated per-trade cap, $300 daily stop, $1,000
+evaluation drawdown stop, and XAUUSD in the allowed symbols. The account must be
+flat, deal history current, entries paused, and all execution/exit outcomes
+resolved. It never sends an MT5 order.
+
+From the installed project directory, using its protected service environment:
+
+```bash
+.venv/bin/python deploy/start_demo_evaluation.py status
+.venv/bin/python deploy/start_demo_evaluation.py prepare --approval-ref OWNER-APPROVAL-REFERENCE
+.venv/bin/python deploy/start_demo_evaluation.py resume
+```
+
+`prepare` archives the entire prior loss record under a unique approval key,
+creates a fresh equity baseline, cancels old unconfirmed proposals, records an
+audit event, and **leaves entries paused**. The same approval reference cannot
+be used again. `resume` requires a fresh XAUUSD quote and current deal history;
+when the market is closed or the feed is stale, leave the account paused and
+retry only `resume` after the feed is fresh. For an explicitly approved
+activation during a market closure, an operator may run `resume` through a
+one-shot service configured to retry on failure and stop on success. Check its
+journal and the Telegram completion notice; do not schedule `prepare` to retry.
+A new breach requires a new owner
+review and a different authorization reference. Never disable or automatically
+reset the loss breaker. Existing trade creation still requires the exact
+Telegram Confirm trade button and passes all quote, risk and broker checks.
+Autonomous trading remains in shadow mode; this procedure does not create an
+autonomy grant or authorize live-money trading.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import timedelta
 
 from sqlalchemy import delete, select
@@ -86,8 +87,14 @@ async def process(application: Application, db: Database) -> None:
 
 
 async def deliver(application: Application, db: Database) -> None:
+    last_memory_prune = 0.0
     while True:
         try:
+            if time.monotonic() - last_memory_prune >= 3600:
+                from trade_agent.memory import prune_expired
+
+                prune_expired(db)
+                last_memory_prune = time.monotonic()
             with db.session() as session:
                 rows = session.scalars(
                     select(IncomingUpdateRecord)

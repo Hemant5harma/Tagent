@@ -1,15 +1,17 @@
 # A practical plan for our AI trading agent: Vantage demo first
 
-Prepared: 2026-09-30. Updated: 2026-09-30. Status: first-release implementation deployed for read-only use; connected execution acceptance is still pending. No autonomous trading or real-money authorization.
+Prepared: 2026-09-30. Updated: 2026-09-30. Status: assisted demo entries enabled after operator-approved evaluation restart; connected execution acceptance is still pending. No autonomous trading or real-money authorization.
 
 ## First-release specification and rollout status (supersedes the historical baseline below)
+
+Follow-up fixes: [SPEC-002](../specs/002-safe-trade-clarification/spec.md) covers USD targets and read-only broker TP calculation. [SPEC-003](../specs/003-conversation-memory/spec.md) adds bounded Telegram memory. [SPEC-004](../specs/004-quote-based-demo-protection/spec.md) adds XAUUSD and quote-based protection. [SPEC-007](../specs/007-native-pending-orders/spec.md) adds broker-held pending entries. [SPEC-006](../specs/006-demo-reactivation/spec.md) records the approved limits and evaluation restart; see its [verification record](../specs/006-demo-reactivation/verification.md). Assisted demo entries are enabled, but a new trade still needs exact Telegram confirmation.
 
 The approved first release is **describe a trade in Telegram → grouped clarification → deterministic validation → one exact-action confirmation → broker submission → read-only mobile dashboard**. Approval expires after five minutes. Modified terms, stale quotes, expired approval, wrong account, or risk violations require stopping, not silently changing the order. Unknown outcomes reconcile; they must never trigger blind replacement orders.
 
 ### Approved boundaries
 
 - Actual Vantage MT5 **demo** account ending 4634, not the fake broker. Live-money and autonomous entries/exits remain disabled.
-- EURUSD only; maximum $10 estimated stop-loss risk; one combined position or pending entry; $50 daily loss stop; $300 evaluation drawdown stop. These are account-wide safety gates, so external positions also prevent new entries. Estimated risk is not a guaranteed maximum loss: gaps, slippage and separately charged costs can exceed it.
+- EURUSD and XAUUSD; maximum $10 estimated stop-loss risk per new trade; five combined positions or pending entries; $300 daily loss stop; $1,000 evaluation drawdown stop. The existing external position counts toward the five. Estimated risk is not a guaranteed maximum loss: gaps, slippage and separately charged costs can exceed it.
 - The owner accepted these limits and a minimum-size connected smoke test. A subsequent upgrade authorization explicitly required **preserving all existing positions and keeping entries paused**. That condition remains in force. No execution smoke orders were placed during the upgrade.
 - Explicit consent permits Telegram text plus a limited demo snapshot to the existing Cloudflare GLM 5.3 provider. This includes balance, equity, free margin, positions/orders, timestamps and masked account ID. Broker passwords, Telegram tokens and other credentials are excluded.
 - Dashboard is view-only. Trade entry, cancellation, closing and SL/TP changes require exact-action confirmation in the private owner-authorized Telegram channel. No discretionary AI exits.

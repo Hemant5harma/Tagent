@@ -31,7 +31,16 @@ class TradeInstructionPayload(StrictModel):
     stop_loss: Decimal = Field(gt=Decimal("0"))
     take_profit: Decimal = Field(gt=Decimal("0"))
     deadline_at: datetime | None = None
+    pending_expires_at: datetime | None = None
+    requested_order_type: OrderType | None = None
     note: str | None = Field(default=None, max_length=512)
+
+    @field_validator("pending_expires_at")
+    @classmethod
+    def expiry_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.utcoffset() is None:
+            raise ValueError("pending expiry must include timezone")
+        return value
 
     @field_validator("symbol")
     @classmethod
@@ -42,6 +51,17 @@ class TradeInstructionPayload(StrictModel):
 class PreflightRequest(StrictModel):
     instruction: TradeInstructionPayload
     order_type: OrderType
+
+
+class ProfitTargetRequest(StrictModel):
+    """Read-only gross-profit estimate, never an execution instruction."""
+
+    account_id: str
+    symbol: str = Field(min_length=1, max_length=32)
+    side: Side
+    volume: Decimal = Field(gt=0, allow_inf_nan=False)
+    entry_price: Decimal = Field(gt=0, allow_inf_nan=False)
+    target_usd: Decimal = Field(gt=0, le=100000, allow_inf_nan=False)
 
 
 class SubmitOrderRequest(PreflightRequest):

@@ -72,7 +72,12 @@ class TradeInstruction(BaseModel):
     entry_price: Decimal | None = Field(default=None, gt=Decimal("0"))
     stop_loss: Decimal = Field(gt=Decimal("0"))
     take_profit: Decimal = Field(gt=Decimal("0"))
+    profit_target_usd: Decimal | None = Field(default=None, gt=Decimal("0"))
+    estimated_gross_profit: Decimal | None = Field(default=None, gt=Decimal("0"))
+    auto_market_protection: bool = False
     deadline_at: datetime | None = None
+    pending_expires_at: datetime | None = None
+    requested_order_type: OrderType | None = None
     note: str | None = Field(default=None, max_length=512)
 
     @field_validator("symbol")
@@ -80,7 +85,7 @@ class TradeInstruction(BaseModel):
     def normalize_symbol(cls, value: str) -> str:
         return value.strip().upper()
 
-    @field_validator("deadline_at")
+    @field_validator("deadline_at", "pending_expires_at")
     @classmethod
     def require_aware_deadline(cls, value: datetime | None) -> datetime | None:
         if value is not None and (value.tzinfo is None or value.utcoffset() is None):
@@ -89,6 +94,8 @@ class TradeInstruction(BaseModel):
 
     @model_validator(mode="after")
     def check_protective_levels(self) -> TradeInstruction:
+        if self.pending_expires_at is not None and self.entry_price is None:
+            raise ValueError("pending expiry requires a pending entry price")
         reference = self.entry_price
         if reference is not None:
             if self.side is Side.BUY and not (self.stop_loss < reference < self.take_profit):
@@ -133,6 +140,7 @@ class AccountSnapshot(BaseModel):
     margin_free: Decimal
     is_demo: bool
     trade_allowed: bool
+    hedging: bool | None = None
 
 
 class PreflightResult(BaseModel):

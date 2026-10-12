@@ -36,3 +36,21 @@ reviewed connector source in the root project:
 $env:PYTHONPATH = (Resolve-Path ..\src).Path
 uv run --project connector python -m mt5_connector.main
 ```
+
+Research-only routes `GET /v1/research/bars/{symbol}` and
+`GET /v1/research/ticks/{symbol}` use the same connector token and remain
+loopback-only. Both take timezone-aware `since` and `until` parameters; bars
+also take a supported `timeframe`. Bar ranges are limited to 31 days, tick
+ranges to one hour, and responses over 10,000 rows fail rather than truncate.
+
+From the project root, export a snapshot with:
+
+```bash
+python deploy/export_research_history.py --symbol XAUUSD --kind bars --timeframe M15 \
+  --since 2026-10-09T12:00:00+00:00 --until 2026-10-09T13:00:00+00:00 \
+  --output data/research/example.json
+```
+
+The exporter reads the backend's configured connector token, verifies the
+dataset digest, and refuses to overwrite a prior snapshot. A tick export does
+not claim complete coverage merely because some ticks were returned.

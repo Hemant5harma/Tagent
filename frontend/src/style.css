@@ -857,3 +857,28 @@ code {
     text-align: right;
   }
 }
+/* Archived evidence stays within its read-only journal panel. */
+.evidence { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 32rem; overflow: auto; font-size: .8rem; }
+.research-report { margin: 1rem 0; padding: 1rem; border: 1px solid var(--line, #ddd); border-radius: .5rem; overflow-wrap: anywhere; }
+.research-report h4 { margin: 0 0 .5rem; text-transform: capitalize; }
+.autonomy-run > details { overflow-wrap: anywhere; }
+.trade-plan { margin: 1rem 0; padding: 1rem; border: 1px solid var(--line, #ddd); border-radius: .5rem; }
+.trade-plan dl { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: .4rem 1rem; }
+.trade-plan dd { margin: 0; overflow-wrap: anywhere; }
+.trade-plan li { margin: .4rem 0; }
+.research-funnel { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .7rem; margin: 1rem 0; }
+.research-funnel > div { display: flex; flex-direction: column; gap: .25rem; padding: .9rem; border: 1px solid var(--line, #ddd); border-radius: .65rem; background: #faf8f3; }
+.research-funnel strong { font-size: 1.35rem; color: #3d352f; }
+.research-funnel span { font-size: .78rem; color: #675e55; }
+.research-diagnostic-columns { align-items: start; }
+.research-diagnostic-columns h3 { font-size: 1rem; margin: .8rem 0; }
+.research-count { display: flex; justify-content: space-between; gap: .8rem; padding: .55rem 0; border-bottom: 1px solid var(--line, #ddd); font-size: .86rem; }
+.research-count span { overflow-wrap: anywhere; }
+.research-count strong { white-space: nowrap; }
+.research-scenarios { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 1rem; margin: 1rem 0; }
+.research-scenarios > article { border: 1px solid var(--line, #ddd); border-radius: .7rem; padding: 1rem; background: #faf8f3; }
+.research-scenarios h3 { margin: 0 0 .5rem; font-size: 1rem; }
+.research-scenarios p { overflow-wrap: anywhere; }
+.research-scenarios .research-funnel { gap: .4rem; }
+.research-scenarios .research-funnel > div { background: #fffdf9; padding: .65rem; }
+@media (max-width: 430px) { .research-funnel { gap: .4rem; } .research-funnel > div { padding: .65rem; } .research-funnel strong { font-size: 1.1rem; } .research-funnel span { font-size: .7rem; } }

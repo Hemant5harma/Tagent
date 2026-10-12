@@ -135,7 +135,18 @@ class TradeService:
         check_demo_budget(self, validated.account)
         return validated
 
-    def create_proposal(self, instruction: TradeInstruction) -> ProposalView:
+    def create_proposal(
+        self,
+        instruction: TradeInstruction,
+        *,
+        origin: str = "manual",
+        strategy_version: str | None = None,
+        decision_run_id: str | None = None,
+    ) -> ProposalView:
+        if origin not in {"manual", "autonomous"}:
+            raise ProposalError("invalid proposal origin")
+        if origin == "autonomous" and (not decision_run_id or not strategy_version):
+            raise ProposalError("autonomous proposals need an attributed decision run")
         from trade_agent.delivery import current_update_id
 
         source_id = current_update_id.get()
@@ -170,6 +181,9 @@ class TradeService:
                     created_at=to_db_time(now),
                     updated_at=to_db_time(now),
                     source_update_id=source_id,
+                    origin=origin,
+                    strategy_version=strategy_version,
+                    decision_run_id=decision_run_id,
                 )
             )
         self._event(proposal_id, None, "proposal_created", validated.summary())
@@ -270,7 +284,12 @@ class TradeService:
                 record.completed_at = to_db_time(utc_now())
 
     def _claim_confirmation(
-        self, proposal_id: str, owner_id: str, version: int, confirmation_token: str
+        self,
+        proposal_id: str,
+        owner_id: str,
+        version: int,
+        confirmation_token: str,
+        autonomy_grant_id: str | None = None,
     ) -> tuple[TradeInstruction, str, str]:
         now = utc_now()
         intent_id = str(uuid4())
@@ -296,6 +315,14 @@ class TradeService:
                 raise ProposalError("proposal confirmation has expired")
             if self._paused():
                 raise ProposalError("new entries are paused")
+            if record.origin == "autonomous":
+                if autonomy_grant_id is None:
+                    raise ProposalError("autonomous proposal requires policy authorization")
+                from trade_agent.autonomy_policy import authorize_submission
+
+                authorize_submission(session, self, record, autonomy_grant_id)
+            elif autonomy_grant_id is not None:
+                raise ProposalError("autonomy cannot authorize a manual proposal")
             reserved = session.scalars(
                 select(ExecutionIntentRecord).where(
                     ExecutionIntentRecord.status.in_(
@@ -326,27 +353,48 @@ class TradeService:
     def confirm(
         self, proposal_id: str, owner_id: str, version: int, confirmation_token: str
     ) -> dict[str, Any]:
+        return self._confirm(proposal_id, owner_id, version, confirmation_token)
+
+    def confirm_autonomous(self, proposal_id: str, owner_id: str, grant_id: str) -> dict[str, Any]:
+        """Internal policy route; it cannot be used for a manual proposal."""
+        proposal = self.proposal(proposal_id)
+        return self._confirm(
+            proposal_id,
+            owner_id,
+            proposal.version,
+            proposal.confirmation_token,
+            autonomy_grant_id=grant_id,
+        )
+
+    def _confirm(
+        self,
+        proposal_id: str,
+        owner_id: str,
+        version: int,
+        confirmation_token: str,
+        autonomy_grant_id: str | None = None,
+    ) -> dict[str, Any]:
         with self._mutation_lock:
             instruction, stored_order_type, key = self._claim_confirmation(
-                proposal_id, owner_id, version, confirmation_token
+                proposal_id, owner_id, version, confirmation_token, autonomy_grant_id
             )
             self._event(proposal_id, None, "confirmation_claimed", {"idempotency_key": key})
+            submission_started = False
             try:
-                validated = self.validate(instruction)
                 approved = self.proposal(proposal_id).validation
-                spec = self.broker.symbol(instruction.symbol)
-                reference_key = "ask" if instruction.side.value == "buy" else "bid"
-                if (
-                    instruction.entry_price is None
-                    and abs(
-                        getattr(validated.quote, reference_key) - Decimal(approved[reference_key])
-                    )
-                    / spec.point
-                    > self.settings.max_slippage_points
-                ):
-                    raise RiskRejected(
-                        "quote moved beyond approved tolerance; create a fresh proposal"
-                    )
+                if instruction.entry_price is None:
+                    quote = self.broker.quote(instruction.symbol)
+                    spec = self.broker.symbol(instruction.symbol)
+                    reference_key = "ask" if instruction.side.value == "buy" else "bid"
+                    if (
+                        abs(getattr(quote, reference_key) - Decimal(approved[reference_key]))
+                        / spec.point
+                        > self.settings.max_slippage_points
+                    ):
+                        raise RiskRejected(
+                            "quote moved beyond approved tolerance; create a fresh proposal"
+                        )
+                validated = self.validate(instruction)
                 state = self.broker.state(instruction.account_id)
                 active_volume = sum(
                     (item.volume for item in state.orders), start=Decimal("0")
@@ -361,15 +409,43 @@ class TradeService:
                     raise RiskRejected(
                         "market movement changed pending order type; create a fresh proposal"
                     )
+                if autonomy_grant_id is not None:
+                    from trade_agent.autonomy_policy import authorize_submission
+
+                    if any(item.symbol == instruction.symbol for item in state.positions) or any(
+                        item.symbol == instruction.symbol for item in state.orders
+                    ):
+                        raise RiskRejected(
+                            "same-symbol exposure appeared before autonomous submission"
+                        )
+                    with self.database.session() as session:
+                        record = session.get(ProposalRecord, proposal_id)
+                        assert record is not None
+                        authorize_submission(
+                            session,
+                            self,
+                            record,
+                            autonomy_grant_id,
+                            validated.estimated_loss,
+                        )
+                    if self._paused():
+                        raise RiskRejected("new entries paused before autonomous submission")
+                submission_started = True
                 result = self.broker.submit(instruction, validated.order_type, key)
             except BrokerUnavailable as exc:
-                self._finish_unknown(proposal_id, key, str(exc))
+                if submission_started:
+                    self._finish_unknown(proposal_id, key, str(exc))
+                    return {
+                        "status": "unknown",
+                        "message": "Outcome unknown—checking broker. Do not submit a replacement.",
+                    }
+                self._finish_rejected(proposal_id, key, str(exc), notify=False)
                 return {
-                    "status": "unknown",
-                    "message": "Outcome unknown—checking broker. Do not submit a replacement.",
+                    "status": "rejected",
+                    "message": "Broker quote or preflight was unavailable before submission. No order was sent; request a fresh proposal.",
                 }
             except (RiskRejected, ValueError) as exc:
-                self._finish_rejected(proposal_id, key, str(exc))
+                self._finish_rejected(proposal_id, key, str(exc), notify=False)
                 return {"status": "rejected", "message": str(exc)}
         if result.status is ExecutionStatus.UNKNOWN:
             self._finish_unknown(
@@ -385,6 +461,7 @@ class TradeService:
                 key,
                 result.reason or "broker rejected request",
                 result.model_dump(mode="json"),
+                notify=False,
             )
             return {"status": "rejected", "message": result.reason}
         with self.database.session() as session:
@@ -438,7 +515,13 @@ class TradeService:
         )
 
     def _finish_rejected(
-        self, proposal_id: str, key: str, message: str, result: dict[str, Any] | None = None
+        self,
+        proposal_id: str,
+        key: str,
+        message: str,
+        result: dict[str, Any] | None = None,
+        *,
+        notify: bool = True,
     ) -> None:
         with self.database.session() as session:
             record = session.get(ProposalRecord, proposal_id)
@@ -451,9 +534,13 @@ class TradeService:
             intent.status = ExecutionStatus.REJECTED.value
             intent.result = result or {"reason": message}
             intent.updated_at = to_db_time(utc_now())
-            self._add_notification(
-                session, record.owner_id, f"Trade rejected: {message}", f"rejected:{proposal_id}"
-            )
+            if notify:
+                self._add_notification(
+                    session,
+                    record.owner_id,
+                    f"Trade rejected: {message}",
+                    f"rejected:{proposal_id}",
+                )
         self._event(proposal_id, None, "submission_rejected", {"reason": message})
 
     def _finish_unknown(self, proposal_id: str, key: str, message: str) -> None:
@@ -977,16 +1064,22 @@ class TradeService:
                         f"Pending order {ledger_intent.broker_order_id} is no longer active.",
                         f"order-ended:{proposal_record.id}:{ledger_intent.broker_order_id}",
                     )
+        # Operator-reviewed existing exposure is not an agent-managed trade.
+        # It still counts toward risk limits and performance account-wide views.
+        from trade_agent.reviewed_exposure import reviewed_references
+
+        reviewed = reviewed_references(self.database, self.settings.account_id)
         unexpected = [
             *(
                 f"order:{item.order_id}"
                 for item in state.orders
-                if item.order_id not in known_orders
+                if item.order_id not in known_orders and f"order:{item.order_id}" not in reviewed
             ),
             *(
                 f"position:{item.position_id}"
                 for item in state.positions
                 if item.position_id not in known_positions
+                and f"position:{item.position_id}" not in reviewed
             ),
         ]
         if unexpected and not self._paused():

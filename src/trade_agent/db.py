@@ -6,7 +6,16 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -31,6 +40,51 @@ class ProposalRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     source_update_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    origin: Mapped[str] = mapped_column(String(16), default="manual", server_default="manual")
+    strategy_version: Mapped[str | None] = mapped_column(String(128))
+    decision_run_id: Mapped[str | None] = mapped_column(String(36), index=True)
+
+
+class AutonomyGrantRecord(Base):
+    __tablename__ = "autonomy_grants"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(128), index=True)
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AutonomousRunRecord(Base):
+    __tablename__ = "autonomous_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "strategy_version",
+            "symbol",
+            "timeframe",
+            "bar_at",
+            name="uq_autonomy_bar",
+        ),
+    )
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    account_id: Mapped[str] = mapped_column(String(128), index=True)
+    owner_id: Mapped[str] = mapped_column(String(128))
+    symbol: Mapped[str] = mapped_column(String(32))
+    timeframe: Mapped[str] = mapped_column(String(8))
+    bar_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    strategy_version: Mapped[str] = mapped_column(String(128))
+    mode: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    snapshot: Mapped[dict] = mapped_column(JSON)
+    reports: Mapped[list] = mapped_column(JSON, default=list)
+    decision: Mapped[dict] = mapped_column(JSON, default=dict)
+    proposal_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    grant_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class ExecutionIntentRecord(Base):
@@ -86,6 +140,13 @@ class IncomingUpdateRecord(Base):
 class DashboardCacheRecord(Base):
     __tablename__ = "dashboard_cache"
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    payload: Mapped[dict] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ConversationMemoryRecord(Base):
+    __tablename__ = "conversation_memory"
+    owner_id: Mapped[str] = mapped_column(String(256), primary_key=True)
     payload: Mapped[dict] = mapped_column(JSON)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 

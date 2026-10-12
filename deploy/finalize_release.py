@@ -1,12 +1,13 @@
 """Install verified release files without touching broker positions or enabling entries."""
+import json
 import os
 import pwd
 import shutil
 import subprocess
-import json
-import psycopg
 from datetime import UTC, datetime
 from pathlib import Path
+
+import psycopg
 
 ROOT = Path('/home/jarvis/trade-agent')
 

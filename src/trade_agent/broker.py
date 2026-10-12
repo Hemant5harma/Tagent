@@ -33,6 +33,20 @@ class BrokerUnavailable(RuntimeError):
 
 
 class BrokerAdapter(ABC):
+    def bars(self, symbol: str, timeframe: str = "M15", count: int = 200) -> list[dict]:
+        raise BrokerUnavailable("this broker does not provide historical candles")
+
+    def profit_target(
+        self,
+        account_id: str,
+        symbol: str,
+        side: Side,
+        volume: Decimal,
+        entry_price: Decimal,
+        target_usd: Decimal,
+    ) -> dict:
+        raise ValueError("this broker does not support USD profit-target conversion")
+
     def history(self, account_id: str, since: datetime, until: datetime) -> dict:
         return {"since": since.isoformat(), "until": until.isoformat(), "deals": []}
 
@@ -347,6 +361,35 @@ class FakeBroker(BrokerAdapter):
 
 
 class MT5HTTPBroker(BrokerAdapter):
+    def bars(self, symbol: str, timeframe: str = "M15", count: int = 200) -> list[dict]:
+        query = urlencode({"timeframe": timeframe, "count": count})
+        payload = self._request("GET", f"/v1/bars/{symbol}?{query}")
+        if not isinstance(payload, dict) or not isinstance(payload.get("bars"), list):
+            raise BrokerUnavailable("connector returned invalid candle history")
+        return payload["bars"]
+
+    def profit_target(
+        self,
+        account_id: str,
+        symbol: str,
+        side: Side,
+        volume: Decimal,
+        entry_price: Decimal,
+        target_usd: Decimal,
+    ) -> dict:
+        return self._request(
+            "POST",
+            "/v1/profit-target",
+            {
+                "account_id": account_id,
+                "symbol": symbol,
+                "side": side,
+                "volume": str(volume),
+                "entry_price": str(entry_price),
+                "target_usd": str(target_usd),
+            },
+        )
+
     def history(self, account_id: str, since: datetime, until: datetime) -> dict:
         query = urlencode({"since": since.isoformat(), "until": until.isoformat()})
         return self._request("GET", f"/v1/accounts/{account_id}/history?{query}")
@@ -389,7 +432,9 @@ class MT5HTTPBroker(BrokerAdapter):
                 "POST",
                 "/v1/preflight",
                 {
-                    "instruction": instruction.model_dump(mode="json"),
+                    "instruction": instruction.model_dump(
+                        mode="json", exclude={"profit_target_usd", "estimated_gross_profit", "auto_market_protection"}
+                    ),
                     "order_type": order_type,
                 },
             )
@@ -403,7 +448,9 @@ class MT5HTTPBroker(BrokerAdapter):
                 "POST",
                 "/v1/orders",
                 {
-                    "instruction": instruction.model_dump(mode="json"),
+                    "instruction": instruction.model_dump(
+                        mode="json", exclude={"profit_target_usd", "estimated_gross_profit", "auto_market_protection"}
+                    ),
                     "order_type": order_type,
                     "idempotency_key": idempotency_key,
                 },

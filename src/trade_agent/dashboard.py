@@ -134,7 +134,7 @@ def create_dashboard(db: Database, dist: Path) -> FastAPI:
     @app.get("/dashboard-api/snapshot", dependencies=[Depends(authenticate)])
     def snapshot(
         period: Literal["today", "7d", "30d", "all"] = "7d",
-        scope: Literal["agent", "account"] = "agent",
+        scope: Literal["agent", "account", "manual", "autonomous"] = "agent",
     ) -> dict:
         return dashboard_data(db, period, scope)
 

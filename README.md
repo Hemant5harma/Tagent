@@ -1,5 +1,9 @@
 # Trade Agent
 
+Optional multi-agent shadow research and bounded autonomous demo execution are
+now available using the existing AI provider. See [the setup and testing guide](docs/AUTONOMY.md).
+Manual and autonomous trades have separate reporting origins. Automation is off by default.
+
 Trade Agent is a human-confirmed trading automation backend. You provide the trade
 parameters, the service validates them against broker capabilities and deterministic
 risk limits, then asks for one confirmation before it submits an order. Monitoring,

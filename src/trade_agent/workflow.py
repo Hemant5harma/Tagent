@@ -12,6 +12,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
+from copy import deepcopy
 from importlib import import_module
 from typing import Any, Literal, NotRequired, TypedDict, cast
 
@@ -19,9 +20,40 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from trade_agent.ai import AIBackendError, ParsedEntry, TradeProposalParse
+from trade_agent.ai import AIBackendError, AIBackendResponseError, ParsedEntry, TradeProposalParse
+from trade_agent.draft_extract import explicit_draft, has_profit_amount
 
 TradeParser = Callable[[str], Awaitable[TradeProposalParse]]
+
+
+def requests_no_stop_loss(message: str) -> bool:
+    """An explicit removal is not a missing value that can inherit an old SL."""
+    text = message.lower().replace("’", "'").replace("_", " ")
+    return bool(
+        re.search(
+            r"\b(?:no|without|remove|omit|skip)\s+(?:the\s+)?(?:sl|stop[ -]?loss)\b"
+            r"|\b(?:don't|do not|dont)\s+(?:need\s+to\s+)?(?:add|set|use|need|want)\s+(?:a\s+|the\s+)?(?:sl|stop[ -]?loss)\b",
+            text,
+        )
+    )
+
+
+def is_draft_followup(message: str) -> bool:
+    """Conservative routing hint; use only while a draft is actively clarifying."""
+    text = message.strip().replace("_", " ")
+    if re.match(r"(?:what|why|how|explain|tell me about|do we have|show|list)\b", text, re.I):
+        return False
+    return bool(
+        requests_no_stop_loss(text)
+        or re.search(
+            r"\b(?:symbol|lots?|volume|size|entry|sl|tp|expire|expires|expiry|stop[ -]?loss|take[ -]?profit)\b",
+            text,
+            re.I,
+        )
+        or re.search(r"\b(?:eur|usd|gbp|jpy|chf|cad|aud|nzd|xau|xag){2}\b", text, re.I)
+        or re.fullmatch(r"(?:buy|sell|market|at market|\d+(?:\.\d+)?)", text, re.I)
+        or re.search(r"\b(?:change|make|set)\s+(?:that|it)\b", text, re.I)
+    )
 
 
 class ConversationState(TypedDict):
@@ -73,6 +105,12 @@ class ConversationRunner:
             self._checkpointer_context = None
         self._graph = None
 
+    async def current(self, owner_id: str) -> dict[str, Any]:
+        """Read a detached draft snapshot without changing its checkpoint."""
+        graph = await self._ensure_graph()
+        snapshot = await graph.aget_state({"configurable": {"thread_id": f"telegram:{owner_id}"}})
+        return deepcopy(dict(snapshot.values))
+
     async def reset(self, owner_id: str) -> None:
         graph = await self._ensure_graph()
         await graph.aupdate_state(
@@ -89,16 +127,25 @@ class ConversationRunner:
             checkpointer = await self._open_postgres_checkpointer()
 
         async def parse_message(state: ConversationState) -> dict[str, Any]:
+            recovered = False
             try:
                 previous = state.get("parsed") if state.get("stage") == "clarifying" else None
                 message = state["message"]
                 # A side-only answer can complete a draft. A fresh instruction
                 # (including conversational "can you buy ...") must not inherit
                 # the previous trade's size or protection values.
-                if re.match(r"\s*new\b", message, re.I) or re.match(
-                    r"\s*(?:(?:please|can you|could you|i want to|i would like to)\s+)*(?:buy|sell)\s+\S",
-                    message,
-                    re.I,
+                if (
+                    re.search(
+                        r"\b(?:open|place|create|prepare)\s+(?:(?:a|an|new|another|one)\s+)*(?:trade|order|position)\b",
+                        message,
+                        re.I,
+                    )
+                    or re.match(r"\s*new\b", message, re.I)
+                    or re.match(
+                        r"\s*(?:(?:please|can you|could you|i want to|i would like to)\s+)*(?:buy|sell)\s+\S",
+                        message,
+                        re.I,
+                    )
                 ):
                     previous = None
                 if previous:
@@ -107,11 +154,42 @@ class ConversationRunner:
                         "the user explicitly replaces them.\n"
                         f"Existing draft: {previous}\nNew user message: {message}"
                     )
-                parsed = await self._parser(message)
-            except AIBackendError as exc:
+                parsed = (
+                    explicit_draft(state["message"].replace("_", " "))
+                    if has_profit_amount(state["message"])
+                    or re.search(
+                        r"\b(?:expire|expires|expiry|buy limit|sell limit|buy stop|sell stop|price rises|price falls|price reaches)\b",
+                        state["message"],
+                        re.I,
+                    )
+                    or (
+                        previous
+                        and is_draft_followup(state["message"])
+                        and (
+                            requests_no_stop_loss(state["message"])
+                            or re.search(
+                                r"\b(?:eur|usd|gbp|jpy|chf|cad|aud|nzd|xau|xag){2}\b",
+                                state["message"],
+                                re.I,
+                            )
+                        )
+                    )
+                    else await self._parser(message)
+                )
+            except AIBackendResponseError:
+                recovered = True
+                parsed = explicit_draft(state["message"])
+                if not _missing_trade_fields(parsed):
+                    parsed = parsed.model_copy(
+                        update={
+                            "intent": "clarification",
+                            "clarification": "I couldn't reliably validate the assistant's response. Please restate the trade with symbol, buy/sell, lots, entry, SL and TP. No trade was submitted.",
+                        }
+                    )
+            except AIBackendError:
                 return {
                     "stage": "failed",
-                    "response": f"AI parser unavailable: {exc}",
+                    "response": "The trade assistant is temporarily unavailable. Please try again; no trade was submitted. /account and /status still work.",
                     "requires_trade_fields": [],
                     "parsed": {},
                 }
@@ -131,10 +209,34 @@ class ConversationRunner:
                         "volume": parsed.volume or old.volume,
                         "entry": parsed.entry if parsed.entry.kind != "missing" else old.entry,
                         "stop_loss": parsed.stop_loss or old.stop_loss,
-                        "take_profit": parsed.take_profit or old.take_profit,
+                        "take_profit": parsed.take_profit
+                        or (
+                            None
+                            if parsed.profit_target_usd is not None
+                            or has_profit_amount(state["message"])
+                            else old.take_profit
+                        ),
+                        "profit_target_usd": parsed.profit_target_usd
+                        or (
+                            None
+                            if parsed.take_profit is not None or has_profit_amount(state["message"])
+                            else old.profit_target_usd
+                        ),
                         "deadline_at": parsed.deadline_at or old.deadline_at,
+                        "pending_expires_at": parsed.pending_expires_at or old.pending_expires_at,
+                        "requested_order_type": parsed.requested_order_type
+                        or old.requested_order_type,
                         "note": parsed.note or old.note,
                         "missing_fields": [],
+                    }
+                )
+            if requests_no_stop_loss(state["message"]):
+                parsed = parsed.model_copy(update={"stop_loss": None})
+            if recovered and not _missing_trade_fields(parsed):
+                parsed = parsed.model_copy(
+                    update={
+                        "intent": "clarification",
+                        "clarification": "I couldn't reliably validate the assistant's response. Please restate the trade with symbol, buy/sell, lots, entry, SL and TP. No trade was submitted.",
                     }
                 )
             return {"parsed": parsed.model_dump(mode="json"), "stage": "clarifying"}
@@ -171,6 +273,15 @@ class ConversationRunner:
                     if missing
                     else (parsed.clarification or "Please clarify your trade details.")
                 )
+                if parsed.profit_target_usd is not None:
+                    text = (
+                        f"Understood: {parsed.side or 'direction missing'}, {parsed.volume or 'size missing'} lots; "
+                        f"target ${parsed.profit_target_usd} estimated gross profit. "
+                        + text
+                        + " A dollar target is not a TP price; fees and slippage can change realized profit."
+                    )
+                elif parsed.clarification and parsed.clarification not in text:
+                    text += " " + parsed.clarification
                 return {"stage": "clarifying", "response": text, "requires_trade_fields": missing}
             return {
                 "stage": "ready_for_confirmation",
@@ -223,8 +334,10 @@ def _missing_trade_fields(parsed: TradeProposalParse) -> list[str]:
         missing.add("entry")
     if parsed.stop_loss is None:
         missing.add("stop_loss")
-    if parsed.take_profit is None:
+    if parsed.take_profit is None and parsed.profit_target_usd is None:
         missing.add("take_profit")
+    else:
+        missing.discard("take_profit")
     return sorted(missing)
 
 

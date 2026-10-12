@@ -128,8 +128,21 @@ class RiskPolicy:
         if min(stop_distance, target_distance) < spec.min_stop_distance_points:
             raise RiskRejected("SL or TP is closer than the broker minimum stop distance")
         state = self.broker.state(instruction.account_id)
-        if self.settings.broker_mode != "fake" and len(state.positions) + len(state.orders) >= 1:
-            raise RiskRejected("Assisted demo allows only one position or pending entry at a time")
+        if (
+            self.settings.broker_mode != "fake"
+            and account.hedging is not True
+            and any(p.symbol == instruction.symbol for p in state.positions)
+        ):
+            raise RiskRejected(
+                "Independent same-symbol entry requires a verified hedging account; netting could change the existing position"
+            )
+        if (
+            self.settings.broker_mode != "fake"
+            and len(state.positions) + len(state.orders) >= self.settings.max_concurrent_exposures
+        ):
+            raise RiskRejected(
+                f"Assisted demo allows {self.settings.max_concurrent_exposures} total positions or pending entries at a time"
+            )
         if len(state.positions) >= self.settings.max_open_positions:
             raise RiskRejected("maximum configured open position count reached")
         if len(state.orders) >= self.settings.max_pending_orders:
@@ -150,6 +163,18 @@ class RiskPolicy:
         if estimated_loss > self.settings.max_estimated_loss:
             raise RiskRejected("estimated stop-loss amount exceeds configured maximum")
         order_type = self.resolve_order_type(instruction, quote)
+        if (
+            instruction.requested_order_type is not None
+            and order_type != instruction.requested_order_type
+        ):
+            raise RiskRejected(
+                "Market crossed the requested pending entry or the order type conflicts with its price. Request a fresh proposal; the order type will not be changed silently"
+            )
+        if (
+            instruction.pending_expires_at is not None
+            and instruction.pending_expires_at <= datetime.now(UTC)
+        ):
+            raise RiskRejected("Pending order expiry has passed; request a fresh proposal")
         preflight = self.broker.preflight(instruction, order_type)
         if not preflight.accepted:
             raise RiskRejected(preflight.reason or "broker preflight rejected request")

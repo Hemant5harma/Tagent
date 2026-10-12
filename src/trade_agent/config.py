@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     dashboard_dist: str = "frontend/dist"
     dashboard_url: str = ""
     assisted_demo_accepted: bool = False
+    auto_demo_protection: bool = False
     max_quote_age_seconds: float = 15.0
     demo_daily_loss_limit: Decimal = Decimal("50")
     demo_drawdown_limit: Decimal = Decimal("300")
@@ -42,6 +43,7 @@ class Settings(BaseSettings):
     max_volume: Decimal = Decimal("1.00")
     max_open_positions: int = 5
     max_pending_orders: int = 5
+    max_concurrent_exposures: int = Field(default=1, ge=1, le=5)
     max_pending_submissions: int = 1
     max_total_volume: Decimal = Decimal("5.00")
     max_estimated_loss: Decimal = Decimal("500.00")
@@ -66,6 +68,21 @@ class Settings(BaseSettings):
     opencode_model: str | None = None
     codex_command: str = "codex"
     codex_model: str | None = None
+    # Research is opt-in; connected autonomy remains demo-only and needs a grant.
+    autonomy_mode: Literal["off", "shadow", "demo"] = "off"
+    autonomy_timeframe: Literal["M5", "M15", "M30", "H1", "H4", "D1"] = "M15"
+    autonomy_bars: int = Field(default=200, ge=60, le=1000)
+    autonomy_interval_seconds: float = Field(default=60, ge=10, le=86400)
+    autonomy_min_confidence: float = Field(default=0.7, ge=0, le=1)
+    autonomy_risk_amount: Decimal = Field(default=Decimal("5"), gt=0, allow_inf_nan=False)
+    autonomy_max_volume: Decimal = Field(default=Decimal("0.10"), gt=0, allow_inf_nan=False)
+    autonomy_stop_atr: Decimal = Field(default=Decimal("2"), ge=1, le=10, allow_inf_nan=False)
+    autonomy_reward_risk: Decimal = Field(default=Decimal("2"), ge=1, le=5, allow_inf_nan=False)
+    autonomy_max_holding_minutes: int = Field(default=240, ge=5, le=1440)
+    autonomy_context_enabled: bool = False
+    autonomy_trade_plans_enabled: bool = False
+    autonomy_comparison_enabled: bool = False
+    fred_api_key: str | None = None
 
     @field_validator("allowed_symbols", mode="before")
     @classmethod

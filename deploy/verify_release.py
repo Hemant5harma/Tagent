@@ -1,5 +1,4 @@
 """Connected read-only checks. Does not submit, modify, cancel, or close trades."""
-import asyncio
 import json
 from datetime import UTC, datetime
 

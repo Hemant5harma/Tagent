@@ -13,6 +13,7 @@ from sqlalchemy.orm import load_only
 
 from trade_agent.db import (
     AgentActivityRecord,
+    AutonomousRunRecord,
     BrokerDealRecord,
     DashboardCacheRecord,
     Database,
@@ -56,7 +57,12 @@ def put_cache(db: Database, key: str, payload: dict) -> None:
             row.payload, row.updated_at = payload, now()
 
 
-def closed_trades(deals: list[dict], managed: set[str], open_ids: set[str]) -> list[dict]:
+def closed_trades(
+    deals: list[dict],
+    managed: set[str],
+    open_ids: set[str],
+    origins: dict[str, set[str]] | None = None,
+) -> list[dict]:
     """Only balanced, fully closed, non-reversal lifecycles are eligible for win rate."""
     groups: dict[str, list[dict]] = defaultdict(list)
     for deal in deals:
@@ -84,6 +90,16 @@ def closed_trades(deals: list[dict], managed: set[str], open_ids: set[str]) -> l
             and all(d.get("magic") == entries[0].get("magic") for d in entries)
             else "external"
         )
+        candidates = origins.get(position, set()) if origins is not None else {"manual"}
+        origin = (
+            next(iter(candidates))
+            if attribution == "agent"
+            and len(candidates) == 1
+            and candidates <= {"manual", "autonomous"}
+            else "unknown"
+            if position in managed
+            else "external"
+        )
 
         def value(field: str, records: list[dict] = items) -> Decimal:
             return sum((Decimal(d.get(field) or "0") for d in records), Decimal(0))
@@ -103,6 +119,7 @@ def closed_trades(deals: list[dict], managed: set[str], open_ids: set[str]) -> l
                 "net_pnl": str(pnl),
                 "costs": str(fees),
                 "source": attribution,
+                "origin": origin,
                 "deal_ids": [d["ticket"] for d in items],
                 "status": "closed",
             }
@@ -124,6 +141,9 @@ def metrics(trades: list[dict]) -> dict:
         "breakevens": len(values) - len(wins) - len(losses),
         "win_rate": len(wins) / len(values) * 100 if values else None,
         "profit_factor": float(winning / abs(losing)) if losses else None,
+        "costs": str(sum((Decimal(t.get("costs") or "0") for t in trades), Decimal(0))),
+        "average_win": str(winning / len(wins)) if wins else None,
+        "average_loss": str(losing / len(losses)) if losses else None,
     }
 
 
@@ -132,11 +152,21 @@ class Reporter:
         self.service, self.db = service, service.database
         self._history_at: datetime | None = None
         self._equity_at: datetime | None = None
+        self._diagnostics_at: datetime | None = None
 
     def collect(self) -> None:
         timestamp = now()
-        state = self.service.broker_state()
         account_id = self.service.settings.account_id
+        if self._diagnostics_at is None or (timestamp - self._diagnostics_at).total_seconds() >= 60:
+            from trade_agent.research_diagnostics import collect as collect_research_diagnostics
+
+            put_cache(
+                self.db,
+                f"research-diagnostics:{account_id}",
+                collect_research_diagnostics(self.db, account_id, as_of=timestamp),
+            )
+            self._diagnostics_at = timestamp
+        state = self.service.broker_state()
         put_cache(
             self.db,
             "broker",
@@ -238,6 +268,9 @@ def main() -> None:
 
 
 def dashboard_data(db: Database, period: str = "7d", scope: str = "agent") -> dict:
+    from trade_agent.autonomy_health import data_health
+    from trade_agent.monitoring import worker_status
+
     timestamp = now()
     since = (
         timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -256,6 +289,9 @@ def dashboard_data(db: Database, period: str = "7d", scope: str = "agent") -> di
                     ProposalRecord.status,
                     ProposalRecord.created_at,
                     ProposalRecord.instruction,
+                    ProposalRecord.origin,
+                    ProposalRecord.strategy_version,
+                    ProposalRecord.decision_run_id,
                 )
             )
             .order_by(ProposalRecord.created_at.desc())
@@ -266,7 +302,9 @@ def dashboard_data(db: Database, period: str = "7d", scope: str = "agent") -> di
                 load_only(
                     ExecutionIntentRecord.id,
                     ExecutionIntentRecord.status,
+                    ExecutionIntentRecord.proposal_id,
                     ExecutionIntentRecord.broker_position_id,
+                    ExecutionIntentRecord.broker_order_id,
                 )
             )
         ).all()
@@ -287,6 +325,8 @@ def dashboard_data(db: Database, period: str = "7d", scope: str = "agent") -> di
             select(AgentActivityRecord).order_by(AgentActivityRecord.id.desc()).limit(100)
         ).all()
         account_id = broker["account"]["account_id"] if broker else ""
+        diagnostic_cache = session.get(DashboardCacheRecord, f"research-diagnostics:{account_id}")
+        screen_cache = session.get(DashboardCacheRecord, f"research-screen:{account_id}")
         deals = [
             row.payload
             for row in session.scalars(
@@ -303,21 +343,77 @@ def dashboard_data(db: Database, period: str = "7d", scope: str = "agent") -> di
             for row in session.scalars(
                 select(DashboardCacheRecord).where(
                     DashboardCacheRecord.key.in_(
-                        ["telegram", "protection", "model", "dashboard_url", "limits"]
+                        ["telegram", "protection", "model", "dashboard_url", "limits", "autonomy"]
                     )
                 )
             )
         }
         managed = {str(row.broker_position_id) for row in intents if row.broker_position_id}
+        # Fetch attribution independently of the recent-proposal display limit.
+        proposal_origins = {
+            proposal_id: origin
+            for proposal_id, origin in session.execute(
+                select(ProposalRecord.id, ProposalRecord.origin)
+            ).all()
+        }
+        origins: dict[str, set[str]] = defaultdict(set)
+        for intent in intents:
+            if intent.broker_position_id:
+                origins[str(intent.broker_position_id)].add(
+                    proposal_origins.get(intent.proposal_id, "unknown")
+                )
+        if broker:
+            order_origins: dict[str, set[str]] = defaultdict(set)
+            for intent in intents:
+                if intent.broker_order_id:
+                    order_origins[str(intent.broker_order_id)].add(
+                        proposal_origins.get(intent.proposal_id, "unknown")
+                    )
+
+            def identified(rows: list[dict], key: str, mapping: dict[str, set[str]]) -> list[dict]:
+                result = []
+                for row in rows:
+                    choices = mapping.get(str(row[key]), set())
+                    origin = (
+                        next(iter(choices))
+                        if len(choices) == 1
+                        else "unknown"
+                        if choices
+                        else "external"
+                    )
+                    result.append({**row, "origin": origin})
+                return result
+
+            broker = {
+                **broker,
+                "state": {
+                    **broker["state"],
+                    "positions": identified(broker["state"]["positions"], "position_id", origins),
+                    "orders": identified(broker["state"]["orders"], "order_id", order_origins),
+                },
+            }
+        runs = session.scalars(
+            select(AutonomousRunRecord)
+            .where(
+                AutonomousRunRecord.account_id == account_id,
+                AutonomousRunRecord.snapshot["data_status"].as_string().is_(None),
+            )
+            .order_by(AutonomousRunRecord.created_at.desc())
+            .limit(50)
+        ).all()
         open_ids = (
             {str(p["position_id"]) for p in broker["state"]["positions"]} if broker else set()
         )
-        all_closed = closed_trades(deals, managed, open_ids)
+        all_closed = closed_trades(deals, managed, open_ids, origins)
         selected = [
             t
             for t in all_closed
             if datetime.fromisoformat(t["closed_at"]) >= since
-            and (scope == "account" or t["source"] == "agent")
+            and (
+                scope == "account"
+                or (scope == "agent" and t["source"] == "agent")
+                or t["origin"] == scope
+            )
         ]
         cash = [d for d in deals if d.get("type") not in {"0", "1"}]
         points = []
@@ -357,11 +453,28 @@ def dashboard_data(db: Database, period: str = "7d", scope: str = "agent") -> di
         }
         return {
             "generated_at": timestamp.isoformat(),
+            "autonomy_comparison_preview": (
+                session.get(
+                    DashboardCacheRecord, f"autonomy-comparison-preview:{account_id}"
+                ).payload
+                if session.get(DashboardCacheRecord, f"autonomy-comparison-preview:{account_id}")
+                else None
+            ),
             "broker": broker,
             "period": period,
             "scope": scope,
             "reporting_timezone": "UTC",
             "metrics": metrics(selected),
+            "origin_metrics": {
+                origin: metrics(
+                    [
+                        t
+                        for t in all_closed
+                        if t["origin"] == origin and datetime.fromisoformat(t["closed_at"]) >= since
+                    ]
+                )
+                for origin in ("manual", "autonomous", "external", "unknown")
+            },
             "closed_trades": selected[:200],
             "equity": points[:: max(1, len(points) // 500)]
             + ([points[-1]] if len(points) > 500 else []),
@@ -393,7 +506,10 @@ def dashboard_data(db: Database, period: str = "7d", scope: str = "agent") -> di
                         if k
                         in {"symbol", "side", "volume", "entry_price", "stop_loss", "take_profit"}
                     },
-                    "source": "user-directed",
+                    "source": "agent",
+                    "origin": p.origin,
+                    "strategy_version": p.strategy_version,
+                    "decision_run_id": p.decision_run_id,
                 }
                 for p in proposals
             ],
@@ -417,10 +533,43 @@ def dashboard_data(db: Database, period: str = "7d", scope: str = "agent") -> di
                 for a in activities
             ],
             "execution": outcomes,
+            "autonomy_runs": [
+                {
+                    "id": r.id,
+                    "symbol": r.symbol,
+                    "timeframe": r.timeframe,
+                    "bar_at": aware(r.bar_at).isoformat(),
+                    "mode": r.mode,
+                    "status": r.status,
+                    "strategy_version": r.strategy_version,
+                    "decision": r.decision,
+                    "reports": r.reports,
+                    "snapshot": {
+                        **{
+                            key: value
+                            for key, value in r.snapshot.items()
+                            if key not in {"bars", "higher_timeframe_bars", "comparison_bars"}
+                        },
+                        "archived_bar_count": len(r.snapshot.get("bars", [])),
+                    },
+                    "proposal_id": r.proposal_id,
+                    "error": scrub(r.error) if r.error else None,
+                    "created_at": aware(r.created_at).isoformat(),
+                }
+                for r in runs
+            ],
             "agent_counts": agent_counts,
             "services": checkpoints,
+            "autonomy_worker": worker_status(db, account_id),
+            "autonomy_market_data": data_health(db, account_id),
+            "research_diagnostics": diagnostic_cache.payload if diagnostic_cache else None,
+            "research_screen": screen_cache.payload if screen_cache else None,
             "instruction_accuracy": "Not evaluated",
-            "prediction_accuracy": "Not available in assisted mode",
+            "prediction_accuracy": (
+                "Not evaluated; use attributed realized outcomes and replay benchmarks"
+                if runs
+                else "Not available in assisted mode"
+            ),
         }
 
 
